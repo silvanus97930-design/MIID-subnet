@@ -50,14 +50,24 @@ different runs and facilitate analysis of results over time.
 import time
 import typing
 import io
+import random
+import re
+from difflib import SequenceMatcher
 import bittensor as bt
 import ollama
 import pandas as pd
 import os
 import numpy as np
 from typing import List, Dict, Tuple, Any, Optional
+from datetime import datetime, timedelta
+from collections import defaultdict
 from tqdm import tqdm
 from PIL import Image
+
+try:
+    import geonamescache
+except ImportError:
+    geonamescache = None
 
 # Bittensor Miner Template:
 from MIID.protocol import IdentitySynapse, S3Submission
@@ -107,6 +117,517 @@ class Miner(BaseMinerNeuron):
         "5CnkkjPdfsA6jJDHv2U6QuiKiivDuvQpECC13ffdmSDbkgtt": "Testnet_asem"
     }
 
+    COUNTRY_ALIASES = {
+        "usa": "united states",
+        "us": "united states",
+        "united states of america": "united states",
+        "u.s.a.": "united states",
+        "u.s.": "united states",
+        "uk": "united kingdom",
+        "u.k.": "united kingdom",
+        "great britain": "united kingdom",
+        "britain": "united kingdom",
+        "uae": "united arab emirates",
+        "korea, south": "south korea",
+        "korea, north": "north korea",
+        "cote d ivoire": "ivory coast",
+        "côte d'ivoire": "ivory coast",
+        "cote d'ivoire": "ivory coast",
+        "the gambia": "gambia",
+        "holland": "the netherlands",
+        "burma": "myanmar",
+        "drc": "democratic republic of the congo",
+        "czech republic": "czechia",
+        "russian federation": "russia",
+        "iran, islamic republic of": "iran",
+        "syrian arab republic": "syria",
+        "viet nam": "vietnam",
+        "moldova, republic of": "moldova",
+        "lao people's democratic republic": "laos",
+        "tanzania, united republic of": "tanzania",
+        "bolivia, plurinational state of": "bolivia",
+        "venezuela, bolivarian republic of": "venezuela",
+        "palestine, state of": "palestinian territory",
+    }
+
+    STREET_SUFFIXES = ["Street", "Avenue", "Road", "Boulevard", "Lane", "Drive", "Way"]
+    DISTRICT_WORDS = ["District", "Quarter", "Ward", "Heights", "Center", "Commons"]
+    STREET_ROOTS = [
+        "Oak", "Maple", "Cedar", "Pine", "River", "Hill", "Market", "Liberty",
+        "Central", "Park", "Garden", "Lake", "Harbor", "Sunrise", "West", "East",
+    ]
+
+    def _register_dynamic_validator(self, hotkey: str) -> bool:
+        """Allow any currently validator-permitted hotkey from metagraph."""
+        if hotkey in self.WHITELISTED_VALIDATORS:
+            return True
+
+        try:
+            uid = self.metagraph.hotkeys.index(hotkey)
+        except ValueError:
+            return False
+
+        try:
+            has_permit = bool(self.metagraph.validator_permit[uid])
+        except Exception:
+            has_permit = False
+
+        if has_permit:
+            self.WHITELISTED_VALIDATORS[hotkey] = f"DynamicValidator_UID{uid}"
+            bt.logging.info(
+                f"Added dynamic validator allowlist entry: uid={uid}, hotkey={hotkey[:16]}..."
+            )
+            return True
+
+        return False
+
+    def _initialize_geodata(self) -> None:
+        """Build country/city indexes used for reward-aligned address generation."""
+        self._geo_available = False
+        self._country_name_to_code: Dict[str, str] = {}
+        self._country_compact_to_code: Dict[str, str] = {}
+        self._country_code_to_name: Dict[str, str] = {}
+        self._city_names_by_country: Dict[str, List[str]] = {}
+        self._city_to_country_codes: Dict[str, List[str]] = {}
+
+        if geonamescache is None:
+            bt.logging.warning("geonamescache unavailable. Falling back to generic address generation.")
+            return
+
+        try:
+            gc = geonamescache.GeonamesCache()
+            countries = gc.get_countries()
+            cities = gc.get_cities()
+
+            for code, data in countries.items():
+                country_name = str(data.get("name", "")).strip()
+                if not country_name:
+                    continue
+                lower_name = country_name.lower()
+                self._country_name_to_code[lower_name] = code
+                self._country_compact_to_code[self._compact_text(lower_name)] = code
+                self._country_code_to_name[code] = country_name
+
+                iso = str(data.get("iso", "")).lower().strip()
+                iso3 = str(data.get("iso3", "")).lower().strip()
+                if iso:
+                    self._country_name_to_code[iso] = code
+                if iso3:
+                    self._country_name_to_code[iso3] = code
+
+            for alias, canonical in self.COUNTRY_ALIASES.items():
+                canonical_code = self._country_name_to_code.get(canonical.lower())
+                if canonical_code:
+                    self._country_name_to_code[alias] = canonical_code
+                    self._country_compact_to_code[self._compact_text(alias)] = canonical_code
+
+            grouped_cities: Dict[str, List[Tuple[int, str]]] = defaultdict(list)
+            city_country_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+            for city_data in cities.values():
+                code = str(city_data.get("countrycode", "")).strip()
+                city_name = str(city_data.get("name", "")).strip()
+                if not code or not city_name:
+                    continue
+                try:
+                    population = int(city_data.get("population", 0) or 0)
+                except Exception:
+                    population = 0
+                grouped_cities[code].append((population, city_name))
+                city_country_counts[city_name.lower()][code] += max(population, 1)
+
+            for code, records in grouped_cities.items():
+                records.sort(reverse=True, key=lambda x: x[0])
+                seen = set()
+                ordered = []
+                for _, city_name in records:
+                    city_norm = city_name.lower().strip()
+                    if not city_norm or city_norm in seen:
+                        continue
+                    seen.add(city_norm)
+                    ordered.append(city_name)
+                    if len(ordered) >= 300:
+                        break
+                if ordered:
+                    self._city_names_by_country[code] = ordered
+
+            for city_name, code_counts in city_country_counts.items():
+                ranked_codes = sorted(code_counts.items(), key=lambda kv: kv[1], reverse=True)
+                self._city_to_country_codes[city_name] = [code for code, _ in ranked_codes]
+
+            self._geo_available = bool(self._country_name_to_code and self._city_names_by_country)
+            bt.logging.info(
+                f"Geodata initialized: {len(self._country_name_to_code)} country aliases, "
+                f"{len(self._city_names_by_country)} countries with cities"
+            )
+        except Exception as e:
+            bt.logging.warning(f"Failed to initialize geodata: {e}")
+            self._geo_available = False
+
+    def _extract_expected_variation_count(self, query_template: str, default: int = 10) -> int:
+        """Parse expected variation count from validator query text."""
+        if not query_template:
+            return default
+        patterns = [
+            r"\bexact(?:ly)?\s+(\d{1,2})\s+variations?\b",
+            r"\bgenerate\s+(\d{1,2})\s+variations?\b",
+            r"\btotal\s+(\d{1,2})\s+variations?\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, query_template, flags=re.IGNORECASE)
+            if match:
+                try:
+                    value = int(match.group(1))
+                    return max(4, min(20, value))
+                except Exception:
+                    continue
+        return default
+
+    @staticmethod
+    def _compact_text(value: str) -> str:
+        compact = re.sub(r"[^a-z]", "", value.lower())
+        compact = compact.replace("republic", "").replace("kingdom", "").replace("state", "")
+        compact = compact.replace("federation", "").replace("democratic", "").replace("islamic", "")
+        return compact
+
+    def _clean_name_candidate(self, raw_name: str, seed_name: str, is_multipart: bool) -> Optional[str]:
+        """Normalize and validate name candidates before scoring."""
+        if not raw_name:
+            return None
+        candidate = re.sub(r"[^A-Za-zÀ-ÿ\s]", " ", str(raw_name))
+        candidate = " ".join(candidate.split()).strip()
+        if not candidate:
+            return None
+        if candidate.lower() == seed_name.lower():
+            return None
+        parts = candidate.split()
+        if is_multipart and len(parts) < 2:
+            return None
+        if not is_multipart and len(parts) != 1:
+            return None
+        return candidate
+
+    @staticmethod
+    def _apply_word_case(original: str, mutated: str) -> str:
+        if not mutated:
+            return mutated
+        if original.isupper():
+            return mutated.upper()
+        if original and original[0].isupper():
+            return mutated.capitalize()
+        return mutated.lower()
+
+    def _mutate_name_part(self, part: str) -> List[str]:
+        """Generate lightweight name mutations for fallback diversity."""
+        part_clean = re.sub(r"[^A-Za-zÀ-ÿ]", "", part)
+        if len(part_clean) < 3:
+            return []
+        lower = part_clean.lower()
+        candidates = []
+
+        # Swap adjacent characters near the center.
+        center = max(1, min(len(lower) - 2, len(lower) // 2))
+        swapped = list(lower)
+        swapped[center], swapped[center + 1] = swapped[center + 1], swapped[center]
+        candidates.append("".join(swapped))
+
+        # Remove one vowel if possible.
+        vowel_idx = next((i for i, ch in enumerate(lower[:-1]) if ch in "aeiou"), None)
+        if vowel_idx is not None:
+            candidates.append(lower[:vowel_idx] + lower[vowel_idx + 1 :])
+
+        # Duplicate one consonant for typo-like behavior.
+        consonant_idx = next((i for i, ch in enumerate(lower[:-1]) if ch.isalpha() and ch not in "aeiou"), None)
+        if consonant_idx is not None:
+            candidates.append(lower[: consonant_idx + 1] + lower[consonant_idx] + lower[consonant_idx + 1 :])
+
+        # Simple phonetic substitutions.
+        substitutions = [("ph", "f"), ("f", "ph"), ("c", "k"), ("k", "c"), ("i", "y"), ("y", "i"), ("v", "w"), ("w", "v")]
+        for src, dst in substitutions:
+            if src in lower:
+                candidates.append(lower.replace(src, dst, 1))
+
+        unique = []
+        seen = set()
+        for cand in candidates:
+            normalized = cand.strip().lower()
+            if len(normalized) < 2 or normalized in seen or normalized == lower:
+                continue
+            seen.add(normalized)
+            unique.append(self._apply_word_case(part_clean, normalized))
+        return unique
+
+    def _build_name_fallback_candidates(self, seed_name: str, is_multipart: bool) -> List[str]:
+        """Generate structured fallback names when LLM output is too short."""
+        seed_parts = seed_name.split()
+        if not seed_parts:
+            return []
+        if not is_multipart:
+            return self._mutate_name_part(seed_parts[0])
+
+        first = seed_parts[0]
+        last = seed_parts[-1]
+        middle = seed_parts[1:-1]
+        first_mut = self._mutate_name_part(first)
+        last_mut = self._mutate_name_part(last)
+        variants = []
+
+        for fm in first_mut:
+            variants.append(" ".join([fm] + middle + [last]))
+        for lm in last_mut:
+            variants.append(" ".join([first] + middle + [lm]))
+        for idx, fm in enumerate(first_mut[:4]):
+            if idx < len(last_mut):
+                variants.append(" ".join([fm] + middle + [last_mut[idx]]))
+
+        # Add an initials-style variant for rule coverage.
+        if len(first) > 1:
+            variants.append(" ".join([f"{first[0]}", *middle, last]))
+
+        deduped = []
+        seen = set()
+        for variant in variants:
+            normalized = " ".join(variant.split()).strip().lower()
+            if not normalized or normalized in seen or normalized == seed_name.lower():
+                continue
+            seen.add(normalized)
+            deduped.append(" ".join(variant.split()))
+        return deduped
+
+    def _ensure_target_name_count(
+        self,
+        seed_name: str,
+        extracted_names: List[str],
+        target_count: int,
+    ) -> List[str]:
+        """Ensure we return a stable count of unique name variations."""
+        is_multipart = len(seed_name.split()) > 1
+        cleaned = []
+        seen = set()
+        for raw in extracted_names:
+            candidate = self._clean_name_candidate(raw, seed_name, is_multipart)
+            if not candidate:
+                continue
+            key = candidate.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(candidate)
+            if len(cleaned) >= target_count:
+                return cleaned[:target_count]
+
+        fallback_candidates = self._build_name_fallback_candidates(seed_name, is_multipart)
+        for fallback in fallback_candidates:
+            key = fallback.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(fallback)
+            if len(cleaned) >= target_count:
+                return cleaned[:target_count]
+
+        # Last resort: deterministic perturbation to avoid empty responses.
+        seed_parts = seed_name.split()
+        counter = 0
+        while len(cleaned) < target_count and counter < target_count * 6:
+            counter += 1
+            if not seed_parts:
+                break
+            part_idx = counter % len(seed_parts)
+            part = seed_parts[part_idx]
+            if len(part) < 2:
+                continue
+            perturb = part[:-1] + random.choice("aeiouwy")
+            perturb = self._apply_word_case(part, perturb)
+            generated = seed_parts.copy()
+            generated[part_idx] = perturb
+            candidate = " ".join(generated)
+            key = candidate.lower()
+            if key == seed_name.lower() or key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(candidate)
+        return cleaned[:target_count]
+
+    def _build_dob_variations(self, seed_dob: str, target_count: int) -> List[str]:
+        """Build DOB variations covering validator scoring buckets."""
+        if target_count <= 0:
+            return []
+        try:
+            base = datetime.strptime(seed_dob.strip(), "%Y-%m-%d")
+        except Exception:
+            fallback = seed_dob.strip() if seed_dob and seed_dob.strip() else "1990-01-01"
+            return [fallback for _ in range(target_count)]
+
+        categories = [
+            base + timedelta(days=1),
+            base - timedelta(days=3),
+            base + timedelta(days=30),
+            base - timedelta(days=90),
+            base + timedelta(days=365),
+        ]
+        dob_values = [d.strftime("%Y-%m-%d") for d in categories]
+        dob_values.append(base.strftime("%Y-%m"))
+
+        extra_offsets = [2, -7, 14, -21, 45, -120, 180, -240, 330, -360]
+        for offset in extra_offsets:
+            dob_values.append((base + timedelta(days=offset)).strftime("%Y-%m-%d"))
+
+        deduped = []
+        seen = set()
+        for dob in dob_values:
+            if dob in seen:
+                continue
+            seen.add(dob)
+            deduped.append(dob)
+            if len(deduped) >= target_count:
+                return deduped[:target_count]
+
+        while len(deduped) < target_count:
+            jitter = (len(deduped) + 1) * 11
+            deduped.append((base + timedelta(days=jitter)).strftime("%Y-%m-%d"))
+        return deduped[:target_count]
+
+    def _resolve_region_target(self, seed_address: str) -> Tuple[str, Optional[str], Optional[str]]:
+        """
+        Resolve seed address into country name/code and optional preferred city.
+        Returns: (country_name, country_code, preferred_city)
+        """
+        seed = str(seed_address or "").strip()
+        if not seed:
+            return "United States", self._country_name_to_code.get("united states"), "New York"
+
+        normalized_seed = seed.lower()
+        parts = [p.strip() for p in seed.split(",") if p.strip()]
+
+        country_code = None
+        country_name = None
+        preferred_city = None
+        seed_is_country_like = False
+
+        # Try direct full-seed country match first.
+        if normalized_seed in self._country_name_to_code:
+            country_code = self._country_name_to_code[normalized_seed]
+            country_name = self._country_code_to_name.get(country_code, seed)
+            seed_is_country_like = True
+        elif self._compact_text(normalized_seed) in self._country_compact_to_code:
+            country_code = self._country_compact_to_code[self._compact_text(normalized_seed)]
+            country_name = self._country_code_to_name.get(country_code, seed)
+            seed_is_country_like = True
+
+        # Try last comma-separated segment as country.
+        if not country_code and parts:
+            last_part = parts[-1].lower()
+            if last_part in self._country_name_to_code:
+                country_code = self._country_name_to_code[last_part]
+                country_name = self._country_code_to_name.get(country_code, parts[-1])
+            elif self._compact_text(last_part) in self._country_compact_to_code:
+                country_code = self._country_compact_to_code[self._compact_text(last_part)]
+                country_name = self._country_code_to_name.get(country_code, parts[-1])
+
+        # Fuzzy fallback for alternate country naming.
+        if not country_code and self._country_code_to_name:
+            best_code = None
+            best_score = 0.0
+            for code, canonical_name in self._country_code_to_name.items():
+                ratio = SequenceMatcher(None, normalized_seed, canonical_name.lower()).ratio()
+                compact_ratio = SequenceMatcher(
+                    None, self._compact_text(normalized_seed), self._compact_text(canonical_name)
+                ).ratio()
+                score = max(ratio, compact_ratio)
+                if score > best_score:
+                    best_score = score
+                    best_code = code
+            if best_code and best_score >= 0.74:
+                country_code = best_code
+                country_name = self._country_code_to_name.get(best_code, seed)
+                seed_is_country_like = True
+
+        # If still unresolved, interpret seed as city.
+        if not country_code:
+            city_key = normalized_seed
+            if city_key in self._city_to_country_codes:
+                ranked = self._city_to_country_codes.get(city_key, [])
+                if ranked:
+                    country_code = ranked[0]
+                    country_name = self._country_code_to_name.get(country_code, seed)
+                    preferred_city = seed
+
+        # Derive preferred city from seed parts if possible.
+        if parts and len(parts) >= 2 and not seed_is_country_like:
+            city_candidate = parts[0]
+            if not any(ch.isdigit() for ch in city_candidate):
+                preferred_city = city_candidate
+
+        if not country_name:
+            country_name = seed
+        return country_name, country_code, preferred_city
+
+    def _pick_city_for_country(self, country_code: Optional[str], preferred_city: Optional[str], idx: int) -> str:
+        """Pick a deterministic city for the resolved country."""
+        if preferred_city:
+            return preferred_city
+        if country_code and country_code in self._city_names_by_country:
+            candidates = self._city_names_by_country[country_code]
+            if candidates:
+                return candidates[idx % len(candidates)]
+        return "New York"
+
+    def _make_address_line(self, city: str, country: str, idx: int) -> str:
+        """Create a realistic, validator-friendly address line."""
+        street_root = self.STREET_ROOTS[idx % len(self.STREET_ROOTS)]
+        street_suffix = self.STREET_SUFFIXES[idx % len(self.STREET_SUFFIXES)]
+        district = self.DISTRICT_WORDS[idx % len(self.DISTRICT_WORDS)]
+        house_num = 10 + (idx * 7 % 980)
+        area_num = 1 + (idx * 3 % 17)
+        postal = 10000 + (idx * 113 % 89999)
+        return (
+            f"{house_num} {street_root} {street_suffix}, "
+            f"{district} {area_num}, "
+            f"{city} {postal}, "
+            f"{country}"
+        )
+
+    def _build_address_variations(self, seed_address: str, target_count: int) -> List[str]:
+        """Build address variations that satisfy validator heuristics and region checks."""
+        if target_count <= 0:
+            return []
+        country_name, country_code, preferred_city = self._resolve_region_target(seed_address)
+        addresses = []
+        seen = set()
+        i = 0
+        while len(addresses) < target_count and i < target_count * 8:
+            city = self._pick_city_for_country(country_code, preferred_city, i)
+            candidate = self._make_address_line(city, country_name, i)
+            normalized = candidate.lower().strip()
+            if normalized not in seen:
+                seen.add(normalized)
+                addresses.append(candidate)
+            i += 1
+
+        if not addresses:
+            fallback = "120 Central Avenue, District 4, New York 10001, United States"
+            addresses = [fallback for _ in range(target_count)]
+        elif len(addresses) < target_count:
+            addresses.extend([addresses[-1]] * (target_count - len(addresses)))
+        return addresses[:target_count]
+
+    def _sync_dynamic_validator_whitelist(self):
+        """Sync allowlist with current validator-permit hotkeys on chain."""
+        added = 0
+        try:
+            for uid, hotkey in enumerate(self.metagraph.hotkeys):
+                if hotkey in self.WHITELISTED_VALIDATORS:
+                    continue
+                if bool(self.metagraph.validator_permit[uid]):
+                    self.WHITELISTED_VALIDATORS[hotkey] = f"DynamicValidator_UID{uid}"
+                    added += 1
+            bt.logging.info(
+                f"Dynamic validator sync complete. Added {added} validator-permitted hotkeys. "
+                f"Total allowlist size: {len(self.WHITELISTED_VALIDATORS)}"
+            )
+        except Exception as e:
+            bt.logging.warning(f"Dynamic validator sync failed: {e}")
+
     def _add_local_validators_to_whitelist(self):
         """Add all registered neurons as whitelisted validators in local_test mode."""
         if not getattr(self.config, 'local_test', False):
@@ -136,7 +657,8 @@ class Miner(BaseMinerNeuron):
         self.model_name = getattr(self.config.neuron, 'model_name', None) if hasattr(self.config, 'neuron') else None
         if self.model_name is None:
             #self.model_name = 'llama3.2:1b'
-            self.model_name = 'tinyllama:latest'
+            # self.model_name = 'tinyllama:latest'
+            self.model_name = 'mistral:latest'
             bt.logging.info(f"No model specified in config, using default model: {self.model_name}")
         
         bt.logging.info(f"Using LLM model: {self.model_name}")
@@ -166,6 +688,11 @@ class Miner(BaseMinerNeuron):
         os.makedirs(self.output_path, exist_ok=True)
         bt.logging.info(f"Mining results will be saved to: {self.output_path}")
 
+        # Initialize geodata indexes for reward-aligned address generation.
+        self._initialize_geodata()
+
+        # Keep static trusted keys, but also include live validator-permitted hotkeys.
+        self._sync_dynamic_validator_whitelist()
         self.axon.verify_fns[IdentitySynapse.__name__] = self._verify_validator_request
 
     async def _verify_validator_request(self, synapse: IdentitySynapse) -> None:
@@ -188,7 +715,7 @@ class Miner(BaseMinerNeuron):
         body_hash = synapse.computed_body_hash
 
         # 1 — is the sender even on our allow‑list?
-        if hotkey not in self.WHITELISTED_VALIDATORS:
+        if not self._register_dynamic_validator(hotkey):
             raise NotVerifiedException(f"{hotkey} is not a whitelisted validator")
 
         # 3 — run all the standard Bittensor checks (nonce window, replay,
@@ -306,7 +833,13 @@ class Miner(BaseMinerNeuron):
         
         # Only proceed with processing if we have enough time
         if remaining > 1.0:  # Ensure at least 1 second for processing
-            variations = self.process_variations(Response_list, run_id, run_dir, synapse.identity)
+            variations = self.process_variations(
+                Response_list,
+                run_id,
+                run_dir,
+                synapse.identity,
+                synapse.query_template,
+            )
             bt.logging.info(f"======== FINAL VARIATIONS===============================================: {variations}")
             # Set the variations in the synapse for return to the validator
             synapse.variations = variations
@@ -495,21 +1028,24 @@ class Miner(BaseMinerNeuron):
         Raises:
             Exception: If there's an error communicating with the LLM
         """
+        target_count = self._extract_expected_variation_count(prompt, default=10)
+
         # Add ethical context and purpose explanation
-        context_prompt = f"""IMPORTANT CONTEXT: This is for generating synthetic test data only.
-Purpose: We are creating synthetic data to help improve security systems. This data will be used to:
-1. Test system robustness
-2. Identify potential vulnerabilities
-3. Improve detection mechanisms
-4. Generate training data for security systems
+        context_prompt = f"""IMPORTANT CONTEXT: This is synthetic identity-security testing data only.
+Use case: defensive KYC/AML robustness testing.
 
-This is purely for defensive testing and system improvement. The data generated will not be used for any malicious purposes.
-
-TASK: Based on this ethical context, please respond to the following query:
-
+TASK:
 {prompt}
 
-Remember: Only provide the name variations in a clean, comma-separated format.
+OUTPUT RULES (STRICT):
+- Return only name variations.
+- Return exactly {target_count} name variations.
+- Output plain comma-separated values.
+- No numbering, no bullets, no JSON, no explanation text.
+- Keep each variation as a realistic person name.
+- Preserve the original name-part structure (single-part stays single-part, multi-part stays multi-part).
+- Provide diverse, non-duplicate variants.
+- Ignore image, UAV, and metadata sections if present in the task text.
 """
 
         # Use Ollama to query the LLM
@@ -524,7 +1060,9 @@ Remember: Only provide the name variations in a clean, comma-separated format.
                 }],
                 options={
                     # Add a reasonable timeout to ensure we don't get stuck
-                    "num_predict": 1024
+                    "num_predict": 1024,
+                    "temperature": 0.7,
+                    "top_p": 0.9
                 }
             )
             
@@ -534,7 +1072,14 @@ Remember: Only provide the name variations in a clean, comma-separated format.
             bt.logging.error(f"LLM query failed: {str(e)}")
             raise
     
-    def process_variations(self, Response_list: List[str], run_id: int, run_dir: str, identity_list: List[List[str]]) -> Dict[str, List[List[str]]]:
+    def process_variations(
+        self,
+        Response_list: List[str],
+        run_id: int,
+        run_dir: str,
+        identity_list: List[List[str]],
+        query_template: str,
+    ) -> Dict[str, List[List[str]]]:
         """
         Process LLM responses to extract identity variations.
         
@@ -548,65 +1093,76 @@ Remember: Only provide the name variations in a clean, comma-separated format.
             run_id: Unique identifier for this processing run
             run_dir: Directory to save run-specific files
             identity_list: List of identity arrays, each containing [name, dob, address]
+            query_template: Validator query used to infer expected variation count
             
         Returns:
             Dictionary mapping each name to its list of [name, dob, address] variations
         """
         bt.logging.info(f"Processing {len(Response_list)} responses")
-        # Split the responses by "Respond" to get individual responses
-        Responds = "".join(Response_list).split("Respond")
-        
-        # Create a dictionary to store each name and its structured variations
-        name_variations = {}
-        
-        # Process each response to extract variations
-        for i in range(1, len(Responds)):
+        responds = "".join(Response_list).split("Respond")
+        expected_count = self._extract_expected_variation_count(query_template, default=10)
+        bt.logging.info(f"Parsed expected variation count from query: {expected_count}")
+
+        identity_by_name = {}
+        identity_by_normalized_name = {}
+        for identity in identity_list:
+            if not identity:
+                continue
+            seed_name = str(identity[0]).strip()
+            if seed_name:
+                identity_by_name[seed_name] = identity
+                norm_seed = re.sub(r"\s+", " ", re.sub(r"[^A-Za-zÀ-ÿ\s]", " ", seed_name)).strip().lower()
+                if norm_seed:
+                    identity_by_normalized_name[norm_seed] = identity
+
+        name_variations: Dict[str, List[List[str]]] = {}
+
+        for i in range(1, len(responds)):
             try:
-                # Process the response to extract the name and variations
-                # Returns: (seed_name, processing_method, variations_list)
-                llm_respond = self.Process_function(Responds[i], False)
-                
-                # Extract the seed name and variations
-                name = llm_respond[0]
-                
-                # Find the corresponding identity in the identity list
-                matching_identity = None
-                for identity in identity_list:
-                    if len(identity) > 0 and identity[0] == name:
-                        matching_identity = identity
-                        break
-                
+                llm_respond = self.Process_function(responds[i], False)
+                seed_name = llm_respond[0]
+
+                matching_identity = identity_by_name.get(seed_name)
                 if matching_identity is None:
-                    bt.logging.warning(f"Could not find identity for name {name}")
+                    norm_name = re.sub(r"\s+", " ", re.sub(r"[^A-Za-zÀ-ÿ\s]", " ", seed_name)).strip().lower()
+                    matching_identity = identity_by_normalized_name.get(norm_name)
+                if matching_identity is None:
+                    bt.logging.warning(f"Could not find identity for name {seed_name}")
                     continue
-                
-                # Get corresponding address and DOB
-                seed_address = matching_identity[2] if len(matching_identity) > 2 else "Unknown"
-                seed_dob = matching_identity[1] if len(matching_identity) > 1 else "Unknown"
-                
-                # Filter out empty or NaN variations
-                variations = [var for var in llm_respond[2] if not pd.isna(var) and var != ""]
-                
-                # Clean each variation and create structured entries
-                structured_variations = []
-                for var in variations:
-                    # Remove unwanted characters
-                    cleaned_var = var.replace(")", "").replace("(", "").replace("]", "").replace("[", "").replace(",", "")
-                    # Remove leading/trailing whitespace
-                    cleaned_var = cleaned_var.strip()
-                    # Only add non-empty variations
-                    if cleaned_var:
-                        # Create structured variation entry: [name_variation, dob_variation, address_variation]
-                        structured_variation = [cleaned_var, seed_dob, seed_address]
-                        structured_variations.append(structured_variation)
-                
-                # Store the structured variations for this name
-                name_variations[name] = structured_variations
-                bt.logging.info(f"Processed {len(structured_variations)} variations for {name}")
+
+                seed_dob = str(matching_identity[1]).strip() if len(matching_identity) > 1 else ""
+                seed_address = str(matching_identity[2]).strip() if len(matching_identity) > 2 else ""
+
+                raw_name_variations = [var for var in llm_respond[2] if not pd.isna(var) and str(var).strip()]
+                names = self._ensure_target_name_count(seed_name, raw_name_variations, expected_count)
+                if not names:
+                    bt.logging.warning(f"No valid name variations for {seed_name}; skipping")
+                    name_variations[seed_name] = []
+                    continue
+
+                target_count = min(expected_count, len(names))
+                names = names[:target_count]
+                dob_variants = self._build_dob_variations(seed_dob, target_count)
+                address_variants = self._build_address_variations(seed_address, target_count)
+
+                structured = []
+                for idx in range(target_count):
+                    structured.append([
+                        names[idx],
+                        dob_variants[idx] if idx < len(dob_variants) else (seed_dob or ""),
+                        address_variants[idx] if idx < len(address_variants) else (seed_address or ""),
+                    ])
+
+                name_variations[seed_name] = structured
+                bt.logging.info(
+                    f"Processed {len(structured)} structured variations for {seed_name} "
+                    f"(DOB non-empty: {sum(1 for s in structured if len(s) > 1 and s[1].strip())}, "
+                    f"Address non-empty: {sum(1 for s in structured if len(s) > 2 and s[2].strip())})"
+                )
             except Exception as e:
                 bt.logging.error(f"Error processing response {i}: {e}")
-        
-        bt.logging.info(f"Generated structured variations: {name_variations}")
+
+        bt.logging.info(f"Generated structured variations for {len(name_variations)} seed names")
         return name_variations
     
     def save_variations_to_json(self, name_variations: Dict[str, List[str]], run_id: int, run_dir: str) -> None:
@@ -906,7 +1462,7 @@ Remember: Only provide the name variations in a clean, comma-separated format.
             )
             return True, "Missing dendrite or hotkey"
 
-        if synapse.dendrite.hotkey not in self.WHITELISTED_VALIDATORS:
+        if not self._register_dynamic_validator(synapse.dendrite.hotkey):
             bt.logging.trace(
                 f"Blacklisting un-registered hotkey {synapse.dendrite.hotkey}"
             )
@@ -941,9 +1497,15 @@ Remember: Only provide the name variations in a clean, comma-separated format.
             return 0.0
 
         # Get the UID of the caller
-        caller_uid = self.metagraph.hotkeys.index(
-            synapse.dendrite.hotkey
-        )
+        try:
+            caller_uid = self.metagraph.hotkeys.index(
+                synapse.dendrite.hotkey
+            )
+        except ValueError:
+            bt.logging.warning(
+                f"Priority fallback: hotkey {synapse.dendrite.hotkey} not found in metagraph"
+            )
+            return 0.0
         
         # Use the stake as the priority
         # Higher stake = higher priority

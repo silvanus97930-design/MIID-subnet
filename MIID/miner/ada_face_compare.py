@@ -29,6 +29,8 @@ Prerequisites:
 import os
 import sys
 import tempfile
+import types
+import importlib.util
 import torch
 import numpy as np
 from PIL import Image
@@ -39,12 +41,54 @@ import cv2
 # Add AdaFace to path (relative to this file)
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 ADA_FACE_PATH = os.path.join(_this_dir, "AdaFace")
+ADA_FACE_ALIGNMENT_PATH = os.path.join(ADA_FACE_PATH, "face_alignment")
+
+# Important: add face_alignment module directory first, otherwise the external
+# "face_alignment" pip package can shadow AdaFace's local modules.
+if os.path.isdir(ADA_FACE_ALIGNMENT_PATH):
+    sys.path.insert(0, ADA_FACE_ALIGNMENT_PATH)
 if os.path.isdir(ADA_FACE_PATH):
     sys.path.insert(0, ADA_FACE_PATH)
 
+
+def _load_local_module(module_name: str, file_path: str):
+    """Load a module directly from a local file path."""
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not create module spec for {file_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 try:
-    from face_alignment import align
-    from face_alignment import mtcnn
+    # Force local AdaFace face_alignment modules to avoid collision with the
+    # pip package named "face_alignment".
+    mtcnn = _load_local_module("adaface_local_mtcnn", os.path.join(ADA_FACE_ALIGNMENT_PATH, "mtcnn.py"))
+
+    # AdaFace align.py instantiates MTCNN with device='cuda:0' at import time.
+    # On CPU-only hosts we remap that to 'cpu' before loading align.py.
+    original_mtcnn_class = mtcnn.MTCNN
+
+    class SafeMTCNN(original_mtcnn_class):
+        def __init__(self, *args, **kwargs):
+            req_device = kwargs.get("device")
+            if isinstance(req_device, str) and req_device.startswith("cuda") and not torch.cuda.is_available():
+                kwargs["device"] = "cpu"
+            super().__init__(*args, **kwargs)
+
+    mtcnn.MTCNN = SafeMTCNN
+
+    face_alignment_pkg = types.ModuleType("face_alignment")
+    face_alignment_pkg.__path__ = [ADA_FACE_ALIGNMENT_PATH]
+    face_alignment_pkg.mtcnn = mtcnn
+    sys.modules["face_alignment"] = face_alignment_pkg
+    sys.modules["face_alignment.mtcnn"] = mtcnn
+
+    align = _load_local_module("adaface_local_align", os.path.join(ADA_FACE_ALIGNMENT_PATH, "align.py"))
+    face_alignment_pkg.align = align
+    sys.modules["face_alignment.align"] = align
+
     from inference import load_pretrained_model, to_input
     
     # Override the hardcoded CUDA device in align.py
@@ -55,7 +99,7 @@ try:
 except ImportError as e:
     raise ImportError(
         f"AdaFace modules could not be imported: {e}. "
-        f"Ensure AdaFace is cloned at {ADA_FACE_PATH}. See module docstring for setup."
+        f"Ensure AdaFace is cloned at {ADA_FACE_PATH} and local modules are available."
     ) from e
 
 

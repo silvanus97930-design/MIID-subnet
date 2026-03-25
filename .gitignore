@@ -27,6 +27,7 @@ build/
 
 # Logs
 *.log
+run/
 
 # Local configuration
 .env
