@@ -206,6 +206,33 @@ class TelegramNotifier:
                 timeout=15,
             )
             if response.status_code != 200:
+                # Telegram rate limiting: back off to avoid hammering the API.
+                if response.status_code == 429:
+                    retry_after_s: Optional[float] = None
+                    try:
+                        data = response.json()
+                        params = data.get("parameters") if isinstance(data, dict) else None
+                        if isinstance(params, dict) and params.get("retry_after") is not None:
+                            retry_after_s = float(params.get("retry_after"))
+                    except Exception:
+                        retry_after_s = None
+
+                    # Fallback: some responses are not reliably parseable as JSON.
+                    if retry_after_s is None:
+                        m = re.search(r"retry after\s*(\d+)", response.text or "")
+                        if m:
+                            retry_after_s = float(m.group(1))
+
+                    # Best-effort: respect retry-after if present; otherwise just return.
+                    if retry_after_s is not None and retry_after_s > 0:
+                        # Cap to keep the notifier responsive.
+                        retry_after_s = min(retry_after_s, 300.0)
+                        print(
+                            f"[telegram] send rate-limited status=429; sleeping {retry_after_s:.0f}s",
+                            flush=True,
+                        )
+                        time.sleep(retry_after_s)
+
                 print(
                     f"[telegram] send failed status={response.status_code} body={response.text[:300]}",
                     flush=True,

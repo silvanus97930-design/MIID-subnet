@@ -57,6 +57,7 @@ import threading
 import unicodedata
 import json
 import hashlib
+import math
 from difflib import SequenceMatcher
 import bittensor as bt
 import ollama
@@ -70,9 +71,24 @@ from tqdm import tqdm
 from PIL import Image
 
 try:
+    import Levenshtein
+except Exception:
+    Levenshtein = None
+
+try:
+    import jellyfish
+except Exception:
+    jellyfish = None
+
+try:
     import geonamescache
 except ImportError:
     geonamescache = None
+
+try:
+    from MIID.validator.rule_evaluator import evaluate_rule_compliance
+except Exception:
+    evaluate_rule_compliance = None
 
 # Bittensor Miner Template:
 from MIID.protocol import IdentitySynapse, S3Submission
@@ -347,39 +363,472 @@ class Miner(BaseMinerNeuron):
             add_rule("insert_random_letter")
         if re.search(r"\bswap[_\s-]*adjacent[_\s-]*(?:syllables?|letters?)\b", lowered) or ("swap" in lowered and "adjacent" in lowered):
             add_rule("swap_adjacent_syllables")
+        if re.search(r"\bswap[_\s-]*random[_\s-]*letter\b", lowered):
+            add_rule("swap_random_letter")
         if re.search(r"\bdelete[_\s-]*random[_\s-]*letter\b", lowered) or ("delete" in lowered and "letter" in lowered):
             add_rule("delete_random_letter")
         if re.search(r"\bremove[_\s-]*random[_\s-]*vowel\b", lowered) or ("remove" in lowered and "vowel" in lowered):
             add_rule("remove_random_vowel")
         if re.search(r"\bremove[_\s-]*random[_\s-]*consonant\b", lowered) or ("remove" in lowered and "consonant" in lowered):
             add_rule("remove_random_consonant")
+        if re.search(r"\bremove[_\s-]*all[_\s-]*spaces\b", lowered) or "remove all spaces" in lowered:
+            add_rule("remove_all_spaces")
         if re.search(r"\bduplicate[_\s-]*random[_\s-]*letter\b", lowered) or ("duplicate" in lowered and "letter" in lowered):
             add_rule("duplicate_random_letter_as_double_letter")
+        if re.search(r"\breplace[_\s-]*random[_\s-]*vowel(?:s)?\b", lowered) or "replace random vowels" in lowered or "different vowels" in lowered:
+            add_rule("replace_random_vowel_with_random_vowel")
+        if re.search(r"\breplace[_\s-]*random[_\s-]*consonant(?:s)?\b", lowered) or "replace random consonants" in lowered or "different consonants" in lowered:
+            add_rule("replace_random_consonant_with_random_consonant")
+        if re.search(r"\bconvert(?:\s+name)?\s+to\s+initials\b", lowered) or "convert name to initials" in lowered or "initials" in lowered:
+            add_rule("shorten_name_to_initials")
+        if re.search(r"\bfirst[_\s-]*name[_\s-]*initial\b", lowered) or "first name to initial" in lowered:
+            add_rule("initial_only_first_name")
         if re.search(r"\babbreviat|abbreviate_name_parts|shorten[_\s-]*name[_\s-]*to[_\s-]*abbreviations\b", lowered):
             add_rule("shorten_name_to_abbreviations")
         if re.search(r"\bname[_\s-]*parts[_\s-]*permut", lowered) or ("permute" in lowered and "name" in lowered):
             add_rule("name_parts_permutations")
 
-        # If a rule percentage is specified but specific rules are phrased loosely,
-        # use a safe default trio of letter-only transforms.
+        # Additional rules supported by validator `rule_evaluator.py`.
+        if "replace spaces" in lowered and "special" in lowered and "character" in lowered:
+            add_rule("replace_spaces_with_random_special_characters")
+        if "double letters" in lowered and "single letter" in lowered:
+            add_rule("replace_double_letters_with_single_letter")
+        if "swap" in lowered and "adjacent conson" in lowered:
+            add_rule("swap_adjacent_consonants")
+        if "title prefix" in lowered and ("mr" in lowered or "dr" in lowered or "title" in lowered):
+            add_rule("add_random_leading_title")
+        if "title suffix" in lowered and ("jr" in lowered or "phd" in lowered or "md" in lowered or "title" in lowered):
+            add_rule("add_random_trailing_title")
+        if ("remove" in lowered or "delete" in lowered) and "special" in lowered and "character" in lowered:
+            add_rule("remove_random_special_character")
+        if ("remove" in lowered or "delete" in lowered) and "title" in lowered:
+            add_rule("remove_title")
+
+        # Also handle cases where the validator includes the explicit snake_case rule keys.
+        explicit_rule_keys = {
+            "replace_spaces_with_random_special_characters",
+            "replace_double_letters_with_single_letter",
+            "swap_adjacent_consonants",
+            "remove_random_special_character",
+            "remove_title",
+            "add_random_leading_title",
+            "add_random_trailing_title",
+        }
+        for explicit_key in explicit_rule_keys:
+            if explicit_key in lowered:
+                add_rule(explicit_key)
+
         if not rules and ("rule-based" in lowered or "transform" in lowered):
             return [
                 "insert_random_letter",
-                "swap_adjacent_syllables",
+                "remove_random_vowel",
                 "shorten_name_to_abbreviations",
             ]
         return rules
+
+    @staticmethod
+    def _normalize_similarity_targets(raw_targets: Optional[Dict[str, float]], default_level: str = "Medium") -> Dict[str, float]:
+        levels = ("Light", "Medium", "Far")
+        targets = raw_targets or {}
+        cleaned: Dict[str, float] = {}
+        total = 0.0
+        for level in levels:
+            try:
+                value = float(targets.get(level, 0.0) or 0.0)
+            except Exception:
+                value = 0.0
+            if value > 0:
+                cleaned[level] = value
+                total += value
+        if total <= 0:
+            return {default_level: 1.0}
+        return {level: (cleaned[level] / total) for level in cleaned}
+
+    def _extract_similarity_targets(
+        self,
+        query_template: str,
+        similarity_kind: str,
+        default: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, float]:
+        """Parse Light/Medium/Far target percentages from validator query text."""
+        default_targets = default or {"Medium": 1.0}
+        text = str(query_template or "")
+        lowered = text.lower()
+        kind = str(similarity_kind or "").strip().lower()
+        if not text.strip() or kind not in {"phonetic", "orthographic"}:
+            return self._normalize_similarity_targets(default_targets)
+
+        anchor = f"{kind} similarity"
+        windows: List[str] = []
+        stop_markers = [
+            "phonetic similarity",
+            "orthographic similarity",
+            "approximately",
+            "additionally",
+            "[additional context]",
+            "[image variation requirements]",
+        ]
+
+        for match in re.finditer(re.escape(anchor), lowered):
+            start_idx = match.start()
+            end_idx = min(len(text), match.end() + 260)
+            for marker in stop_markers:
+                if marker == anchor:
+                    continue
+                marker_idx = lowered.find(marker, match.end())
+                if marker_idx != -1:
+                    end_idx = min(end_idx, marker_idx)
+            windows.append(text[start_idx:end_idx])
+
+        if not windows:
+            windows = [text]
+
+        extracted: Dict[str, float] = {}
+        pair_pattern = re.compile(
+            r"(\d{1,3})%\s*(?:[^.;,\n]{0,40}?)\b(light|medium|far)\b",
+            flags=re.IGNORECASE,
+        )
+
+        for window in windows:
+            for pct_text, level_text in pair_pattern.findall(window):
+                try:
+                    pct = float(pct_text)
+                except Exception:
+                    continue
+                if 0.0 <= pct <= 100.0:
+                    extracted[level_text.capitalize()] = pct / 100.0
+            if extracted:
+                break
+
+        return self._normalize_similarity_targets(extracted or default_targets)
+
+    @staticmethod
+    def _bucket_counts_from_targets(total_count: int, targets: Dict[str, float]) -> Dict[str, int]:
+        levels = ["Light", "Medium", "Far"]
+        if total_count <= 0:
+            return {level: 0 for level in levels}
+
+        normalized = Miner._normalize_similarity_targets(targets)
+        raw_counts = {level: normalized.get(level, 0.0) * total_count for level in levels}
+        counts = {level: int(math.floor(raw_counts[level])) for level in levels}
+        assigned = sum(counts.values())
+        ordering = sorted(
+            levels,
+            key=lambda level: (raw_counts[level] - counts[level], normalized.get(level, 0.0)),
+            reverse=True,
+        )
+        order_idx = 0
+        while assigned < total_count and ordering:
+            level = ordering[order_idx % len(ordering)]
+            counts[level] += 1
+            assigned += 1
+            order_idx += 1
+        return counts
+
+    @staticmethod
+    def _score_to_level(score: Optional[float], boundaries: Dict[str, Tuple[float, float]]) -> Optional[str]:
+        if score is None:
+            return None
+        for level, (lower, upper) in boundaries.items():
+            if lower <= score <= upper:
+                return level
+        return None
+
+    @staticmethod
+    def _validator_phonetic_similarity(original_name: str, variation: str) -> float:
+        if not original_name or not variation:
+            return 0.0
+        if jellyfish is None:
+            return float(SequenceMatcher(None, original_name.casefold(), variation.casefold()).ratio())
+
+        algorithms = {
+            "soundex": lambda x, y: jellyfish.soundex(x) == jellyfish.soundex(y),
+            "metaphone": lambda x, y: jellyfish.metaphone(x) == jellyfish.metaphone(y),
+            "nysiis": lambda x, y: jellyfish.nysiis(x) == jellyfish.nysiis(y),
+        }
+        rng = random.Random(hash(original_name) % 10000)
+        selected = rng.sample(list(algorithms.keys()), k=min(3, len(algorithms)))
+        weights = [rng.random() for _ in selected]
+        total_weight = sum(weights) or 1.0
+        normalized_weights = [weight / total_weight for weight in weights]
+        score = sum(
+            float(algorithms[algo](original_name, variation)) * weight
+            for algo, weight in zip(selected, normalized_weights)
+        )
+        return float(score)
+
+    @staticmethod
+    def _validator_orthographic_similarity(original_name: str, variation: str) -> float:
+        if not original_name or not variation:
+            return 0.0
+        if Levenshtein is None:
+            return float(SequenceMatcher(None, original_name.casefold(), variation.casefold()).ratio())
+        try:
+            distance = Levenshtein.distance(original_name, variation)
+        except Exception:
+            return float(SequenceMatcher(None, original_name.casefold(), variation.casefold()).ratio())
+        max_len = max(len(original_name), len(variation), 1)
+        return max(0.0, 1.0 - (distance / max_len))
+
+    @staticmethod
+    def _has_excessive_letter_repetition(text: str, max_repetition: int = 2) -> bool:
+        if not text:
+            return False
+        pattern = r'(.)\1{' + str(max_repetition) + r',}'
+        return re.search(pattern, str(text), flags=re.IGNORECASE) is not None
+
+    def _query_allows_structure_breaks(self, seed_name: str, requested_rules: Optional[List[str]]) -> bool:
+        if len(str(seed_name or "").split()) < 2:
+            return False
+        rule_set = set(requested_rules or [])
+        # These rules intentionally change word-boundary structure (spaces -> non-spaces / initials shortening).
+        return any(
+            rule in rule_set
+            for rule in {
+                "remove_all_spaces",
+                "shorten_name_to_initials",
+                "replace_spaces_with_random_special_characters",
+            }
+        )
+
+    def _candidate_rule_hits(self, seed_name: str, candidates: List[str], requested_rules: List[str]) -> Dict[str, List[str]]:
+        if not candidates or not requested_rules or evaluate_rule_compliance is None:
+            return {}
+        try:
+            compliant_by_rule, _ = evaluate_rule_compliance(
+                seed_name.lower(),
+                [candidate.lower() for candidate in candidates],
+                requested_rules,
+            )
+        except Exception as e:
+            bt.logging.debug(f"Validator rule evaluator unavailable for local KAV scoring: {e}")
+            return {}
+
+        reverse: Dict[str, List[str]] = defaultdict(list)
+        for rule_name, compliant_variations in compliant_by_rule.items():
+            for variation in compliant_variations:
+                if rule_name not in reverse[variation]:
+                    reverse[variation].append(rule_name)
+        return reverse
+
+    def _score_candidate_for_validator(
+        self,
+        seed_name: str,
+        candidate: str,
+        candidate_rule_hits: Dict[str, List[str]],
+    ) -> Dict[str, Any]:
+        candidate_norm = self._normalize_name_text(candidate)
+        seed_norm = self._normalize_name_text(seed_name)
+        seed_parts = seed_norm.split()
+        candidate_parts = candidate_norm.split()
+        is_multipart = len(seed_parts) > 1
+        exact_structure = len(candidate_parts) == len(seed_parts)
+        candidate_key = candidate_norm.lower()
+        rule_hits = list(candidate_rule_hits.get(candidate_key, []))
+
+        phonetic_boundaries = {
+            "Light": (0.80, 1.00),
+            "Medium": (0.60, 0.79),
+            "Far": (0.30, 0.59),
+        }
+        orthographic_boundaries = {
+            "Light": (0.70, 1.00),
+            "Medium": (0.50, 0.69),
+            "Far": (0.20, 0.49),
+        }
+
+        if is_multipart and len(candidate_parts) >= 2:
+            seed_first = seed_parts[0]
+            seed_last = seed_parts[-1]
+            candidate_first = candidate_parts[0]
+            candidate_last = candidate_parts[-1]
+            phonetic_score = (
+                0.3 * self._validator_phonetic_similarity(seed_first, candidate_first)
+                + 0.7 * self._validator_phonetic_similarity(seed_last, candidate_last)
+            )
+            orthographic_score = (
+                0.3 * self._validator_orthographic_similarity(seed_first, candidate_first)
+                + 0.7 * self._validator_orthographic_similarity(seed_last, candidate_last)
+            )
+        else:
+            phonetic_score = self._validator_phonetic_similarity(seed_norm.replace(" ", ""), candidate_norm.replace(" ", ""))
+            orthographic_score = self._validator_orthographic_similarity(seed_norm.replace(" ", ""), candidate_norm.replace(" ", ""))
+
+        length_ratio = min(
+            len(candidate_norm.replace(" ", "")) / max(len(seed_norm.replace(" ", "")), 1),
+            len(seed_norm.replace(" ", "")) / max(len(candidate_norm.replace(" ", "")), 1),
+        )
+        length_ratio = max(0.0, min(1.0, length_ratio))
+
+        structure_score = 1.0 if exact_structure else (0.92 if rule_hits else 0.72)
+        base_score = (
+            0.45 * phonetic_score
+            + 0.35 * orthographic_score
+            + 0.10 * length_ratio
+            + 0.10 * structure_score
+        )
+        if self._has_excessive_letter_repetition(candidate_norm, max_repetition=2):
+            base_score *= 0.8
+
+        return {
+            "name": candidate_norm,
+            "key": candidate_key,
+            "rule_hits": rule_hits,
+            "phonetic_score": float(phonetic_score),
+            "orthographic_score": float(orthographic_score),
+            "phonetic_level": self._score_to_level(phonetic_score, phonetic_boundaries),
+            "orthographic_level": self._score_to_level(orthographic_score, orthographic_boundaries),
+            "base_score": float(base_score),
+            "exact_structure": exact_structure,
+        }
+
+    def _is_near_duplicate_candidate(self, candidate: str, selected_names: List[str]) -> bool:
+        candidate_key = self._canonical_name_key(candidate)
+        if not candidate_key:
+            return True
+        for existing in selected_names:
+            existing_key = self._canonical_name_key(existing)
+            if not existing_key:
+                continue
+            combined_similarity = (
+                self._validator_phonetic_similarity(candidate_key, existing_key) * 0.7
+                + self._validator_orthographic_similarity(candidate_key, existing_key) * 0.3
+            )
+            if combined_similarity > 0.99:
+                return True
+        return False
+
+    def _select_validator_aligned_names(
+        self,
+        seed_name: str,
+        candidates: List[str],
+        target_count: int,
+        query_template: str = "",
+    ) -> List[str]:
+        if target_count <= 0 or not candidates:
+            return []
+        if len(candidates) <= target_count:
+            return candidates[:target_count]
+
+        requested_rules = self._extract_requested_transformations(query_template)
+        phonetic_targets = self._extract_similarity_targets(query_template, "phonetic", default={"Medium": 1.0})
+        orthographic_targets = self._extract_similarity_targets(query_template, "orthographic", default={"Medium": 1.0})
+        rule_percentage = self._extract_rule_percentage(query_template, default=0.0)
+        candidate_rule_hits = self._candidate_rule_hits(seed_name, candidates, requested_rules)
+
+        infos = [
+            self._score_candidate_for_validator(seed_name, candidate, candidate_rule_hits)
+            for candidate in candidates
+        ]
+        infos = [info for info in infos if info.get("name")]
+        infos.sort(key=lambda item: item.get("base_score", 0.0), reverse=True)
+
+        available_rule_candidates = sum(1 for info in infos if info.get("rule_hits"))
+        rule_target_count = 0
+        if requested_rules and rule_percentage > 0 and available_rule_candidates > 0:
+            rule_target_count = int(round(target_count * rule_percentage))
+            if target_count > 1:
+                rule_target_count = min(target_count - 1, max(1, rule_target_count))
+            else:
+                rule_target_count = 1
+            rule_target_count = min(rule_target_count, available_rule_candidates)
+
+        non_rule_target = max(0, target_count - rule_target_count)
+        desired_phonetic = self._bucket_counts_from_targets(non_rule_target, phonetic_targets)
+        desired_orthographic = self._bucket_counts_from_targets(non_rule_target, orthographic_targets)
+
+        selected_infos: List[Dict[str, Any]] = []
+        selected_names: List[str] = []
+        selected_phonetic = Counter()
+        selected_orthographic = Counter()
+        covered_rules = set()
+
+        def add_selected(info: Dict[str, Any]) -> None:
+            selected_infos.append(info)
+            selected_names.append(info["name"])
+            if info.get("phonetic_level"):
+                selected_phonetic[info["phonetic_level"]] += 1
+            if info.get("orthographic_level"):
+                selected_orthographic[info["orthographic_level"]] += 1
+            covered_rules.update(info.get("rule_hits", []))
+
+        def candidate_usable(info: Dict[str, Any]) -> bool:
+            return not self._is_near_duplicate_candidate(info["name"], selected_names)
+
+        while len(selected_infos) < non_rule_target:
+            pool = [info for info in infos if info not in selected_infos and not info.get("rule_hits")]
+            if not pool:
+                pool = [info for info in infos if info not in selected_infos]
+            best_info = None
+            best_score = None
+            for info in pool:
+                if not candidate_usable(info):
+                    continue
+                score = info.get("base_score", 0.0) * 4.0
+                phonetic_level = info.get("phonetic_level")
+                orthographic_level = info.get("orthographic_level")
+                if phonetic_level and selected_phonetic[phonetic_level] < desired_phonetic.get(phonetic_level, 0):
+                    score += 1.6
+                elif phonetic_level is None:
+                    score -= 0.2
+                if orthographic_level and selected_orthographic[orthographic_level] < desired_orthographic.get(orthographic_level, 0):
+                    score += 1.6
+                elif orthographic_level is None:
+                    score -= 0.2
+                if info.get("exact_structure"):
+                    score += 0.3
+                if info.get("rule_hits"):
+                    score -= 0.8
+                if best_info is None or score > best_score:
+                    best_info = info
+                    best_score = score
+            if best_info is None:
+                break
+            add_selected(best_info)
+
+        while len([info for info in selected_infos if info.get("rule_hits")]) < rule_target_count:
+            pool = [info for info in infos if info not in selected_infos and info.get("rule_hits")]
+            best_info = None
+            best_score = None
+            for info in pool:
+                if not candidate_usable(info):
+                    continue
+                new_rule_coverage = len(set(info.get("rule_hits", [])) - covered_rules)
+                score = info.get("base_score", 0.0) * 3.5 + (new_rule_coverage * 2.0)
+                if info.get("exact_structure"):
+                    score += 0.15
+                if best_info is None or score > best_score:
+                    best_info = info
+                    best_score = score
+            if best_info is None:
+                break
+            add_selected(best_info)
+
+        for info in infos:
+            if len(selected_infos) >= target_count:
+                break
+            if info in selected_infos or not candidate_usable(info):
+                continue
+            add_selected(info)
+
+        bt.logging.info(
+            f"KAV validator reranker for '{seed_name}': pool={len(candidates)}, selected={len(selected_infos)}, "
+            f"rule_target={rule_target_count}, phonetic_targets={desired_phonetic}, orthographic_targets={desired_orthographic}"
+        )
+        return [info["name"] for info in selected_infos[:target_count]]
 
     @staticmethod
     def _normalize_name_text(raw_name: str) -> str:
         """Unicode-normalize and keep name-like text only."""
         normalized = unicodedata.normalize("NFKC", str(raw_name or ""))
         normalized = normalized.replace("’", "'").replace("`", "'").replace("´", "'")
+        # Keep punctuation/special chars needed by validator rule checks (titles, space->special, special char removal).
+        validator_special_chars = "!@#$%^&*()_+-=[]{}|;:,.<>?"
+        allowed = {"'", "-"} | set(validator_special_chars)
         cleaned = "".join(
-            ch if (ch.isalpha() or ch.isspace() or ch in {"'", "-"}) else " "
+            ch if (ch.isalpha() or ch.isspace() or ch in allowed) else " "
             for ch in normalized
         )
-        cleaned = cleaned.replace("-", " ").replace("'", " ")
         return " ".join(cleaned.split()).strip()
 
     @staticmethod
@@ -427,10 +876,19 @@ class Miner(BaseMinerNeuron):
 
         return False
 
-    def _is_name_like_candidate(self, candidate: str, seed_name: str, is_multipart: bool) -> bool:
+    def _is_name_like_candidate(
+        self,
+        candidate: str,
+        seed_name: str,
+        is_multipart: bool,
+        requested_rules: Optional[List[str]] = None,
+    ) -> bool:
         candidate_norm = self._normalize_name_text(candidate)
         seed_norm = self._normalize_name_text(seed_name)
         if not candidate_norm or not seed_norm:
+            return False
+
+        if self._has_excessive_letter_repetition(candidate_norm, max_repetition=2):
             return False
 
         candidate_key = self._canonical_name_key(candidate_norm)
@@ -440,10 +898,32 @@ class Miner(BaseMinerNeuron):
 
         candidate_parts = candidate_norm.split()
         seed_parts = seed_norm.split()
+        requested_rule_set = set(requested_rules or [])
+        structure_break_allowed = False
 
         if is_multipart:
             if len(candidate_parts) < 2:
-                return False
+                structure_break_allowed = self._query_allows_structure_breaks(seed_name, list(requested_rule_set))
+                if not structure_break_allowed:
+                    return False
+                compact_candidate = "".join(candidate_parts).casefold()
+                compact_seed = "".join(seed_parts).casefold()
+                initials = "".join(token[0] for token in seed_parts if token).casefold()
+                compact_similarity = SequenceMatcher(None, compact_seed, compact_candidate).ratio()
+                if "shorten_name_to_initials" in requested_rule_set and compact_candidate == initials:
+                    pass
+                elif "remove_all_spaces" in requested_rule_set and compact_candidate == compact_seed:
+                    pass
+                elif "replace_spaces_with_random_special_characters" in requested_rule_set:
+                    # Candidate will contain special characters at space boundaries, which can reduce similarity.
+                    # Compare only letter content for the structure gate.
+                    filtered_candidate = re.sub(r"[^a-z]", "", compact_candidate)
+                    filtered_seed = re.sub(r"[^a-z]", "", compact_seed)
+                    filtered_similarity = SequenceMatcher(None, filtered_seed, filtered_candidate).ratio()
+                    if filtered_similarity < 0.48:
+                        return False
+                elif compact_similarity < 0.48:
+                    return False
             if len(candidate_parts) > max(len(seed_parts) + 1, 4):
                 return False
         else:
@@ -467,10 +947,19 @@ class Miner(BaseMinerNeuron):
             return False
 
         similarity = SequenceMatcher(None, seed_key, candidate_key).ratio()
-        if is_multipart and similarity < 0.40:
+        if is_multipart and not structure_break_allowed and similarity < 0.40:
             return False
         if not is_multipart and similarity < 0.30:
             return False
+        if is_multipart and structure_break_allowed:
+            compact_similarity = SequenceMatcher(
+                None,
+                seed_key.replace(" ", ""),
+                candidate_key.replace(" ", ""),
+            ).ratio()
+            initials = "".join(token[0] for token in seed_parts if token).casefold()
+            if compact_similarity < 0.45 and candidate_key.replace(" ", "") != initials:
+                return False
 
         return True
 
@@ -527,14 +1016,25 @@ class Miner(BaseMinerNeuron):
 
         return None, None
 
-    def _clean_name_candidate(self, raw_name: str, seed_name: str, is_multipart: bool) -> Optional[str]:
+    def _clean_name_candidate(
+        self,
+        raw_name: str,
+        seed_name: str,
+        is_multipart: bool,
+        requested_rules: Optional[List[str]] = None,
+    ) -> Optional[str]:
         """Normalize and validate name candidates before scoring."""
         if not raw_name:
             return None
         candidate = self._normalize_name_text(str(raw_name))
         if not candidate:
             return None
-        if not self._is_name_like_candidate(candidate, seed_name, is_multipart):
+        if not self._is_name_like_candidate(
+            candidate,
+            seed_name,
+            is_multipart,
+            requested_rules=requested_rules,
+        ):
             return None
         return candidate
 
@@ -591,7 +1091,7 @@ class Miner(BaseMinerNeuron):
     def _apply_rule_to_seed_name(self, seed_name: str, rule: str, attempt: int) -> Optional[str]:
         """
         Build one deterministic candidate intended to satisfy a requested transformation rule.
-        Uses letter-only transforms to avoid non-letter penalties.
+        Uses letter-only transforms where possible to avoid non-letter penalties.
         """
         parts = [p for p in str(seed_name).split() if p.strip()]
         if not parts:
@@ -601,7 +1101,16 @@ class Miner(BaseMinerNeuron):
         mutable_parts = [p if p else raw for p, raw in zip(mutable_parts, parts)]
         target_idx = attempt % len(mutable_parts)
         base_part = mutable_parts[target_idx]
-        if len(base_part) < 2:
+        if len(base_part) < 2 and rule not in {
+            "remove_all_spaces",
+            "shorten_name_to_initials",
+            "initial_only_first_name",
+            "replace_spaces_with_random_special_characters",
+            "remove_random_special_character",
+            "remove_title",
+            "add_random_leading_title",
+            "add_random_trailing_title",
+        }:
             return None
 
         if rule == "insert_random_letter":
@@ -625,6 +1134,30 @@ class Miner(BaseMinerNeuron):
             result[target_idx] = "".join(chars)
             return " ".join(result)
 
+        if rule == "swap_adjacent_consonants":
+            # Swap one eligible adjacent consonant pair within the chosen part.
+            if len(base_part) < 2:
+                return None
+            vowels = set("aeiou")
+            lower = base_part.lower()
+            eligible = [
+                i
+                for i in range(len(lower) - 1)
+                if lower[i].isalpha()
+                and lower[i + 1].isalpha()
+                and (lower[i] not in vowels)
+                and (lower[i + 1] not in vowels)
+                and (lower[i] != lower[i + 1])
+            ]
+            if not eligible:
+                return None
+            i = eligible[attempt % len(eligible)]
+            chars = list(base_part)
+            chars[i], chars[i + 1] = chars[i + 1], chars[i]
+            result = mutable_parts.copy()
+            result[target_idx] = "".join(chars)
+            return " ".join(result)
+
         if rule in ("delete_random_letter", "remove_random_vowel", "remove_random_consonant"):
             if len(base_part) < 4:
                 return None
@@ -636,7 +1169,7 @@ class Miner(BaseMinerNeuron):
             if not idx_pool:
                 return None
             rm_at = idx_pool[attempt % len(idx_pool)]
-            mutated = base_part[:rm_at] + base_part[rm_at + 1:]
+            mutated = base_part[:rm_at] + base_part[rm_at + 1 :]
             if len(mutated) < 2:
                 return None
             result = mutable_parts.copy()
@@ -649,6 +1182,79 @@ class Miner(BaseMinerNeuron):
             result = mutable_parts.copy()
             result[target_idx] = mutated
             return " ".join(result)
+
+        if rule == "replace_double_letters_with_single_letter":
+            # Delete one character from a double-letter run.
+            if len(base_part) < 2:
+                return None
+            lower = base_part.lower()
+            eligible = [i for i in range(len(lower) - 1) if lower[i].isalpha() and lower[i] == lower[i + 1]]
+            if not eligible:
+                return None
+            i = eligible[attempt % len(eligible)]
+            mutated = base_part[:i] + base_part[i + 1 :]
+            if len(mutated) < 1:
+                return None
+            result = mutable_parts.copy()
+            result[target_idx] = mutated
+            return " ".join(result)
+
+        if rule == "replace_random_vowel_with_random_vowel":
+            vowel_idx = [i for i, ch in enumerate(base_part) if ch.lower() in "aeiou"]
+            if not vowel_idx:
+                return None
+            replace_at = vowel_idx[attempt % len(vowel_idx)]
+            vowels = "aeiou"
+            current = base_part[replace_at].lower()
+            replacements = [v for v in vowels if v != current]
+            replacement = replacements[(attempt + replace_at) % len(replacements)]
+            mutated = base_part[:replace_at] + replacement + base_part[replace_at + 1 :]
+            result = mutable_parts.copy()
+            result[target_idx] = self._apply_word_case(base_part, mutated)
+            return " ".join(result)
+
+        if rule == "replace_random_consonant_with_random_consonant":
+            consonant_idx = [i for i, ch in enumerate(base_part) if ch.isalpha() and ch.lower() not in "aeiou"]
+            if not consonant_idx:
+                return None
+            replace_at = consonant_idx[attempt % len(consonant_idx)]
+            consonants = "bcdfghjklmnpqrstvwxyz"
+            current = base_part[replace_at].lower()
+            replacements = [c for c in consonants if c != current]
+            replacement = replacements[(attempt + replace_at) % len(replacements)]
+            mutated = base_part[:replace_at] + replacement + base_part[replace_at + 1 :]
+            result = mutable_parts.copy()
+            result[target_idx] = self._apply_word_case(base_part, mutated)
+            return " ".join(result)
+
+        if rule == "remove_all_spaces":
+            if len(mutable_parts) < 2:
+                return None
+            return "".join(mutable_parts)
+
+        if rule == "replace_spaces_with_random_special_characters":
+            seed_str = str(seed_name).strip()
+            special_pool = "!@#$%^&*()_+-=[]{}|;:,.<>?"
+            if " " not in seed_str:
+                return None
+            out_chars: List[str] = []
+            space_i = 0
+            for ch in seed_str:
+                if ch == " ":
+                    out_chars.append(special_pool[(attempt + space_i) % len(special_pool)])
+                    space_i += 1
+                else:
+                    out_chars.append(ch)
+            return "".join(out_chars)
+
+        if rule == "shorten_name_to_initials":
+            if len(mutable_parts) < 2:
+                short_len = max(2, min(len(base_part) - 1, len(base_part) // 2 + 1))
+                return mutable_parts[0][:short_len]
+            return "".join(word[0] for word in mutable_parts if word)
+
+        if rule == "initial_only_first_name" and len(mutable_parts) >= 2:
+            return " ".join([mutable_parts[0][0], *mutable_parts[1:]])
 
         if rule == "shorten_name_to_abbreviations":
             if len(mutable_parts) == 1:
@@ -667,6 +1273,36 @@ class Miner(BaseMinerNeuron):
             shift = (attempt % (len(mutable_parts) - 1)) + 1
             return " ".join(mutable_parts[shift:] + mutable_parts[:shift])
 
+        if rule == "remove_random_special_character":
+            seed_str = str(seed_name).strip()
+            special_chars = set("!@#$%^&*()_+-=[]{}|;:,.<>?")
+            positions = [i for i, ch in enumerate(seed_str) if ch in special_chars]
+            if not positions:
+                return None
+            i = positions[attempt % len(positions)]
+            return seed_str[:i] + seed_str[i + 1 :]
+
+        if rule == "remove_title":
+            seed_str = str(seed_name).strip()
+            seed_lower = seed_str.lower()
+            titles = ["Mr.", "Mrs.", "Ms.", "Mr", "Mrs", "Ms", "Miss", "Dr.", "Dr", "Prof.", "Prof", "Sir", "Lady", "Lord", "Dame", "Master", "Mistress", "Rev.", "Hon.", "Capt.", "Col.", "Lt.", "Sgt.", "Maj."]
+            # Deterministically pick which matching title to remove.
+            for j in range(len(titles)):
+                title = titles[(attempt + j) % len(titles)]
+                if seed_lower.startswith(title.lower() + " "):
+                    return seed_str[len(title) + 1 :]
+            return None
+
+        if rule == "add_random_leading_title":
+            titles = ["Mr.", "Mrs.", "Ms.", "Mr", "Mrs", "Ms", "Miss", "Dr.", "Dr", "Prof.", "Prof", "Sir", "Lady", "Lord", "Dame", "Master", "Mistress", "Rev.", "Hon.", "Capt.", "Col.", "Lt.", "Sgt.", "Maj."]
+            title = titles[attempt % len(titles)]
+            return f"{title} {str(seed_name).strip()}"
+
+        if rule == "add_random_trailing_title":
+            suffixes = ["Jr.", "Sr.", "III", "IV", "V", "PhD", "MD", "Esq.", "Jr", "Sr"]
+            suffix = suffixes[attempt % len(suffixes)]
+            return f"{str(seed_name).strip()} {suffix}"
+
         return None
 
     def _build_rule_aware_candidates(self, seed_name: str, rules: List[str], target_count: int) -> List[str]:
@@ -682,7 +1318,12 @@ class Miner(BaseMinerNeuron):
         while len(candidates) < target_count and attempt < max_attempts:
             rule = rules[attempt % len(rules)]
             raw_candidate = self._apply_rule_to_seed_name(seed_name, rule, attempt)
-            cleaned = self._clean_name_candidate(raw_candidate or "", seed_name, is_multipart)
+            cleaned = self._clean_name_candidate(
+                raw_candidate or "",
+                seed_name,
+                is_multipart,
+                requested_rules=rules,
+            )
             attempt += 1
             if not cleaned:
                 continue
@@ -693,11 +1334,17 @@ class Miner(BaseMinerNeuron):
             candidates.append(cleaned)
         return candidates
 
-    def _build_name_fallback_candidates(self, seed_name: str, is_multipart: bool) -> List[str]:
+    def _build_name_fallback_candidates(
+        self,
+        seed_name: str,
+        is_multipart: bool,
+        requested_rules: Optional[List[str]] = None,
+    ) -> List[str]:
         """Generate structured fallback names when LLM output is too short."""
         seed_parts = seed_name.split()
         if not seed_parts:
             return []
+        requested_rule_set = set(requested_rules or [])
         if not is_multipart:
             return self._mutate_name_part(seed_parts[0])
 
@@ -716,9 +1363,13 @@ class Miner(BaseMinerNeuron):
             if idx < len(last_mut):
                 variants.append(" ".join([fm] + middle + [last_mut[idx]]))
 
-        # Add an initials-style variant for rule coverage.
         if len(first) > 1:
             variants.append(" ".join([f"{first[0]}", *middle, last]))
+
+        if "remove_all_spaces" in requested_rule_set:
+            variants.append("".join(seed_parts))
+        if "shorten_name_to_initials" in requested_rule_set:
+            variants.append("".join(part[0] for part in seed_parts if part))
 
         deduped = []
         seen = set()
@@ -739,79 +1390,102 @@ class Miner(BaseMinerNeuron):
     ) -> List[str]:
         """Ensure we return a stable count of unique name variations."""
         is_multipart = len(seed_name.split()) > 1
-        cleaned = []
+        requested_rules = self._extract_requested_transformations(query_template)
+        cleaned: List[str] = []
         seen = set()
-        for raw in extracted_names:
-            candidate = self._clean_name_candidate(raw, seed_name, is_multipart)
+        pool_limit = max(24, target_count * 4)
+
+        def add_candidate(raw_value: str) -> None:
+            candidate = self._clean_name_candidate(
+                raw_value,
+                seed_name,
+                is_multipart,
+                requested_rules=requested_rules,
+            )
             if not candidate:
-                continue
+                return
             key = candidate.lower()
             if key in seen:
-                continue
+                return
             seen.add(key)
             cleaned.append(candidate)
-            if len(cleaned) >= target_count:
-                return cleaned[:target_count]
 
-        # Proactively inject a bounded set of rule-targeted candidates when requested.
+        for raw in extracted_names:
+            add_candidate(raw)
+            if len(cleaned) >= pool_limit:
+                break
+
         rule_percentage = self._extract_rule_percentage(query_template, default=0.0)
-        requested_rules = self._extract_requested_transformations(query_template)
-        if requested_rules and rule_percentage > 0:
+        if requested_rules and rule_percentage > 0 and len(cleaned) < pool_limit:
             rule_target_count = int(round(target_count * rule_percentage))
             if target_count > 1:
                 rule_target_count = min(target_count - 1, max(1, rule_target_count))
             else:
                 rule_target_count = 1
-            rule_candidates = self._build_rule_aware_candidates(seed_name, requested_rules, rule_target_count)
-            prioritized = []
-            prioritized_seen = set()
-            for candidate in rule_candidates + cleaned:
-                key = candidate.lower()
-                if key in prioritized_seen:
-                    continue
-                prioritized_seen.add(key)
-                prioritized.append(candidate)
-                if len(prioritized) >= target_count:
+            rule_pool_target = min(pool_limit - len(cleaned), max(len(requested_rules) + 2, rule_target_count * 2))
+            for candidate in self._build_rule_aware_candidates(seed_name, requested_rules, rule_pool_target):
+                add_candidate(candidate)
+                if len(cleaned) >= pool_limit:
                     break
-            cleaned = prioritized
-            seen = prioritized_seen
 
-        fallback_candidates = self._build_name_fallback_candidates(seed_name, is_multipart)
-        for fallback in fallback_candidates:
-            key = fallback.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            cleaned.append(fallback)
-            if len(cleaned) >= target_count:
-                return cleaned[:target_count]
+        for fallback in self._build_name_fallback_candidates(
+            seed_name,
+            is_multipart,
+            requested_rules=requested_rules,
+        ):
+            add_candidate(fallback)
+            if len(cleaned) >= pool_limit:
+                break
 
-        # Last resort: deterministic perturbation to avoid empty responses.
-        seed_parts = seed_name.split()
+        seed_parts = [p for p in seed_name.split() if p.strip()]
         counter = 0
-        while len(cleaned) < target_count and counter < target_count * 6:
+        max_attempts = max(target_count * 20, 60)
+        while len(cleaned) < max(target_count, min(pool_limit, target_count + 8)) and counter < max_attempts:
             counter += 1
             if not seed_parts:
                 break
+
             part_idx = counter % len(seed_parts)
-            part = seed_parts[part_idx]
-            if len(part) < 2:
+            part = seed_parts[part_idx].strip()
+            if not part:
                 continue
-            if all(ord(ch) < 128 for ch in part):
-                pool = "aeiouwy"
-                replacement = pool[(counter + part_idx) % len(pool)]
+
+            mode = counter % 4
+            if len(part) == 1:
+                perturb = part + part
+            elif mode == 0:
+                swap_at = max(0, min(len(part) - 2, len(part) // 2))
+                chars = list(part)
+                chars[swap_at], chars[swap_at + 1] = chars[swap_at + 1], chars[swap_at]
+                perturb = "".join(chars)
+            elif mode == 1:
+                dup_at = max(0, min(len(part) - 1, len(part) // 2))
+                perturb = part[:dup_at] + part[dup_at] + part[dup_at:]
+            elif mode == 2:
+                if all(ord(ch) < 128 for ch in part):
+                    pool = "aeiouwy"
+                    replacement = pool[(counter + part_idx) % len(pool)]
+                else:
+                    replacement = part[(counter + 1) % len(part)]
+                perturb = part[:-1] + replacement
             else:
-                replacement = part[0]
-            perturb = part[:-1] + replacement
+                if all(ord(ch) < 128 for ch in part):
+                    suffix_pool = "rstlnm"
+                    perturb = part + suffix_pool[(counter + part_idx) % len(suffix_pool)]
+                else:
+                    perturb = part + part[-1]
+
             perturb = self._apply_word_case(part, perturb)
             generated = seed_parts.copy()
             generated[part_idx] = perturb
-            candidate = " ".join(generated)
-            key = candidate.lower()
-            if key == seed_name.lower() or key in seen:
-                continue
-            seen.add(key)
-            cleaned.append(candidate)
+            add_candidate(" ".join(generated).strip())
+
+        if not cleaned:
+            return []
+
+        selected = self._select_validator_aligned_names(seed_name, cleaned, target_count, query_template)
+        if selected:
+            return selected[:target_count]
         return cleaned[:target_count]
 
     def _build_dob_variations(self, seed_dob: str, target_count: int) -> List[str]:
@@ -1233,6 +1907,8 @@ class Miner(BaseMinerNeuron):
 
     def _unload_ollama_model(self) -> None:
         """Release Ollama model from GPU memory before Phase 4 image generation."""
+        release_wait = max(float(os.environ.get("PHASE4_OLLAMA_RELEASE_WAIT_SECONDS", "2.5") or 0.0), 0.0)
+        poll_interval = 0.25
         try:
             result = subprocess.run(
                 ["ollama", "stop", self.model_name],
@@ -1242,6 +1918,21 @@ class Miner(BaseMinerNeuron):
                 check=False,
             )
             if result.returncode == 0:
+                deadline = time.time() + release_wait
+                while time.time() < deadline:
+                    ps_result = subprocess.run(
+                        ["ollama", "ps"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    if ps_result.returncode == 0 and self.model_name not in ps_result.stdout:
+                        remaining = deadline - time.time()
+                        if remaining > 0:
+                            time.sleep(min(remaining, 0.5))
+                        break
+                    time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
                 bt.logging.info(f"Released Ollama model {self.model_name} before Phase 4")
             elif result.stderr:
                 bt.logging.debug(
@@ -1541,16 +2232,43 @@ class Miner(BaseMinerNeuron):
                 configured_attempts = getattr(self.config.neuron, "phase4_retry_attempts", 2)
             max_attempts = max(1, int(configured_attempts or 2))
 
+            def _env_int(name: str, default: int) -> int:
+                raw = os.environ.get(name)
+                if raw is None:
+                    return int(default)
+                try:
+                    return int(str(raw).strip() or str(default))
+                except Exception:
+                    return int(default)
+
+            base_candidates = max(1, _env_int("PHASE4_CANDIDATES_PER_REQUEST", _env_int("FLUX_CANDIDATES_PER_REQUEST", 4)))
+            candidate_retry_boost = max(0, _env_int("PHASE4_RETRY_CANDIDATE_BOOST", 2))
+            max_retry_candidates = max(base_candidates, _env_int("PHASE4_MAX_CANDIDATES_PER_REQUEST", 10))
+            default_batch_size = max(1, _env_int("PHASE4_GENERATION_BATCH_SIZE", _env_int("FLUX_GENERATION_BATCH_SIZE", 4)))
+            retry_batch_size = max(1, _env_int("PHASE4_RETRY_GENERATION_BATCH_SIZE", max(1, default_batch_size - 1)))
+
             target_round = int(image_request.target_drand_round)
             if target_round <= 0:
                 self._increment_fail_reason(fail_reasons, "phase4_invalid_target_round", len(variation_requests))
                 bt.logging.error(f"Phase 4: Invalid drand target round: {target_round}")
                 return [], fail_reasons
-
             challenge_id = image_request.challenge_id or "sandbox_test"
             path_message = f"{challenge_id}:{self.wallet.hotkey.ss58_address}"
             path_signature = self.wallet.hotkey.sign(path_message.encode()).hex()[:16]
             bt.logging.debug(f"Phase 4: Generated path_signature: {path_signature}")
+
+            run_id = str(getattr(synapse, "run_id", int(time.time())))
+            debug_save_images = os.environ.get("PHASE4_DEBUG_SAVE_IMAGES", "false").strip().lower() in {"1", "true", "yes", "on"}
+            debug_dir = ""
+            if debug_save_images:
+                debug_dir = os.path.join(self.output_path, f"run_{run_id}", "phase4_debug", challenge_id)
+                os.makedirs(debug_dir, exist_ok=True)
+                request_image_path = os.path.join(debug_dir, f"{seed_image_name}_request.png")
+                try:
+                    base_image.save(request_image_path, format="PNG")
+                    bt.logging.info(f"Phase 4 debug: saved request image to {request_image_path}")
+                except Exception as e:
+                    bt.logging.warning(f"Phase 4 debug: failed to save request image: {e}")
 
             if not is_timelock_available():
                 bt.logging.error("Phase 4: Timelock unavailable; refusing unencrypted submissions")
@@ -1561,13 +2279,73 @@ class Miner(BaseMinerNeuron):
 
             for req_index, request in enumerate(variation_requests, start=1):
                 base_variation_type = req_type(request)
+                intensity = req_intensity(request)
                 label = req_label(request)
                 success = False
                 last_reason = "phase4_unknown_failure"
+                # Identity preservation gets harder for near-profile ("far") pose edits.
+                # Calibrate the gate so we submit candidates that are very likely to pass
+                # validator-side identity checks, while still rejecting obvious failures.
+                identity_threshold = float(os.environ.get("PHASE4_MIN_IDENTITY_SIMILARITY", "0.7"))
+
+                # Candidate search expansion for far pose edits.
+                req_base_candidates = base_candidates
+                req_candidate_retry_boost = candidate_retry_boost
+                req_max_retry_candidates = max_retry_candidates
+
+                if base_variation_type == "pose_edit" and intensity.lower() == "far":
+                    identity_threshold = float(
+                        os.environ.get("PHASE4_MIN_IDENTITY_SIMILARITY_POSE_FAR", "0.66")
+                    )
+
+                    # Allow broader candidate sampling for far pose edits.
+                    pose_far_min = _env_int("PHASE4_POSE_FAR_CANDIDATES_PER_REQUEST_MIN", req_base_candidates)
+                    pose_far_max = _env_int("PHASE4_POSE_FAR_MAX_CANDIDATES_PER_REQUEST", req_max_retry_candidates)
+                    pose_far_boost = _env_int("PHASE4_POSE_FAR_CANDIDATE_BOOST", max(1, req_candidate_retry_boost))
+                    pose_far_hard_cap = _env_int("PHASE4_POSE_FAR_HARD_MAX_CANDIDATES", 8)
+
+                    req_base_candidates = min(max(req_base_candidates, pose_far_min), pose_far_hard_cap)
+                    req_max_retry_candidates = min(max(req_max_retry_candidates, pose_far_max), pose_far_hard_cap)
+                    req_candidate_retry_boost = max(req_candidate_retry_boost, pose_far_boost)
+
+                if base_variation_type == "lighting_edit" and intensity.lower() == "medium":
+                    # Calibrate identity gate for lighting changes; embeddings can
+                    # drop even when the identity is visually preserved.
+                    identity_threshold = float(
+                        os.environ.get(
+                            "PHASE4_MIN_IDENTITY_SIMILARITY_LIGHTING_MEDIUM",
+                            "0.62",
+                        )
+                    )
+
+                if base_variation_type == "screen_replay" and intensity.lower() == "standard":
+                    # Screen replay captures include display optics (glare, moire),
+                    # which can shift embeddings without necessarily changing identity.
+                    identity_threshold = float(
+                        os.environ.get(
+                            "PHASE4_MIN_IDENTITY_SIMILARITY_SCREEN_REPLAY_STANDARD",
+                            "0.68",
+                        )
+                    )
 
                 for attempt in range(1, max_attempts + 1):
                     try:
-                        generated = generate_variations(base_image, [request])
+                        attempt_candidates = min(
+                            req_max_retry_candidates,
+                            req_base_candidates + (attempt - 1) * req_candidate_retry_boost,
+                        )
+                        attempt_batch_size = default_batch_size if attempt == 1 else retry_batch_size
+                        bt.logging.debug(
+                            f"Phase 4: {label} attempt {attempt}/{max_attempts} generating with "
+                            f"candidates={attempt_candidates}, batch_size={attempt_batch_size}"
+                        )
+
+                        generated = generate_variations(
+                            base_image,
+                            [request],
+                            candidates_per_request_override=attempt_candidates,
+                            request_batch_size_override=attempt_batch_size,
+                        )
                         if not generated:
                             last_reason = "phase4_generation_empty"
                             bt.logging.warning(
@@ -1584,10 +2362,51 @@ class Miner(BaseMinerNeuron):
                             )
                             continue
 
-                        if not validate_variation(var, base_image, min_similarity=0.7):
+                        similarity = var.get("adaface_similarity")
+                        if similarity is None:
+                            similarity = 1.0 if validate_variation(var, base_image, min_similarity=identity_threshold) else 0.0
+                        else:
+                            try:
+                                similarity = float(similarity)
+                            except Exception:
+                                similarity = 0.0
+                        candidate_count = int(var.get("candidate_count", 1) or 1)
+                        selected_idx = int(var.get("selected_candidate_index", 0) or 0)
+
+                        if debug_save_images:
+                            selected_image = var.get("image")
+                            if isinstance(selected_image, Image.Image):
+                                safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", label).strip("_") or "variation"
+                                score_tag = f"{similarity:.4f}"
+                                final_image_path = os.path.join(
+                                    debug_dir,
+                                    f"req{req_index:02d}_{safe_label}_attempt{attempt}_sel{selected_idx}of{candidate_count}_score{score_tag}.png",
+                                )
+                                try:
+                                    selected_image.save(final_image_path, format="PNG")
+                                    debug_meta = {
+                                        "run_id": run_id,
+                                        "challenge_id": challenge_id,
+                                        "request_index": req_index,
+                                        "label": label,
+                                        "attempt": attempt,
+                                        "selected_candidate_index": selected_idx,
+                                        "candidate_count": candidate_count,
+                                        "adaface_similarity": similarity,
+                                        "candidate_scores": var.get("candidate_scores"),
+                                        "image_hash": var.get("image_hash", ""),
+                                    }
+                                    with open(f"{final_image_path}.json", "w", encoding="utf-8") as f:
+                                        json.dump(debug_meta, f, ensure_ascii=False, indent=2)
+                                    bt.logging.debug(f"Phase 4 debug: saved selected image to {final_image_path}")
+                                except Exception as e:
+                                    bt.logging.warning(f"Phase 4 debug: failed to save selected image: {e}")
+
+                        if similarity < identity_threshold:
                             last_reason = "phase4_identity_not_preserved"
                             bt.logging.warning(
-                                f"Phase 4: {label} attempt {attempt}/{max_attempts} failed face-identity check"
+                                f"Phase 4: {label} attempt {attempt}/{max_attempts} failed face-identity check "
+                                f"(score={similarity:.4f} < {identity_threshold:.2f}, selected={selected_idx}, candidates={candidate_count})"
                             )
                             continue
 
@@ -1690,24 +2509,76 @@ class Miner(BaseMinerNeuron):
         target_count = self._extract_expected_variation_count(prompt, default=10)
 
         # Add ethical context and purpose explanation
+#         context_prompt = f"""IMPORTANT CONTEXT: This is synthetic identity-security testing data only.
+# Use case: defensive KYC/AML robustness testing.
+
+# TASK:
+# {prompt}
+
+# OUTPUT RULES (STRICT):
+# - Return only person-name variations.
+# - Return exactly {target_count} comma-separated entries.
+# - No numbering, no bullets, no JSON, no extra commentary.
+# - Match any requested Light/Medium/Far phonetic and orthographic percentages as closely as possible.
+# - If rule-based transformations are requested, keep approximately that fraction of outputs rule-compliant; keep the rest standard.
+# - Preserve source structure: single-part stays single-part; multi-part stays multi-part unless the task explicitly requests initials or removing spaces.
+# - For multi-part names, preserve both first and last name identity strongly; prefer spelling changes over inventing new tokens.
+# - Keep each variation as a plausible legal name token sequence.
+# - Do not include countries, cities, addresses, metadata, IDs, or occupations.
+# - Do not include the unchanged original seed name.
+# - No duplicates.
+# - Allowed characters: letters from any language plus spaces, apostrophes, and hyphens.
+# - Ignore image/UAV/model instructions if present in the task text.
+# """
+
+# Add ethical context and purpose explanation
         context_prompt = f"""IMPORTANT CONTEXT: This is synthetic identity-security testing data only.
-Use case: defensive KYC/AML robustness testing.
+            Use case: defensive KYC/AML robustness testing.
 
-TASK:
-{prompt}
+            TASK:
+            {prompt}
 
-OUTPUT RULES (STRICT):
-- Return only person-name variations.
-- Return exactly {target_count} comma-separated entries.
-- No numbering, no bullets, no JSON, no extra commentary.
-- Preserve source structure: single-part stays single-part; multi-part stays multi-part.
-- Keep each variation as a plausible legal name token sequence.
-- Do not include countries, cities, addresses, metadata, IDs, or occupations.
-- Do not include the unchanged original seed name.
-- No duplicates.
-- Allowed characters: letters from any language plus spaces, apostrophes, and hyphens.
-- Ignore image/UAV/model instructions if present in the task text.
-"""
+            OUTPUT RULES (STRICT):
+            1. Output exactly {target_count} name variations as a single line.
+            2. Formatting: exactly {target_count} comma-separated entries, no numbering, no bullets, no JSON, no extra text.
+            - Do NOT include any commas inside an individual name entry.
+            3. Content: Return ONLY person-name variations.
+            - Do NOT include DOB, addresses, countries, cities, metadata, IDs, or occupations.
+            - Do NOT repeat the unchanged seed name.
+            4. Uniqueness: No duplicates.
+            5. Allowed characters:
+            - letters from any language + spaces
+            - for special transformations only: use non-space special characters that are NOT commas
+            - do NOT rely on commas inside names
+            6. Structure preservation (tokenization by spaces):
+            - If the seed is single-part, keep every variation single-part unless the TASK explicitly requests initials/abbreviations.
+            - If the seed is multi-part, keep the same number of space-separated parts unless the TASK explicitly requests one of:
+                a) abbreviate name parts (same part count; shorten each part but keep it starting with the original part)
+                b) convert name to initials / use first name initial (output initials form; periods optional)
+                c) replace spaces with special characters / remove_all_spaces (output with NO spaces)
+                d) name_parts_permutations / reorder name parts (same tokens, different order)
+                e) initial_only_first_name (first part becomes an initial; remaining parts unchanged)
+            7. Rule-based transformations:
+            For roughly the requested fraction of entries indicated by the TASK, apply the transformations EXACTLY as described (one rule operation per chosen entry). For the transformation types below, follow these mechanics:
+            - remove a random vowel: delete exactly one vowel letter
+            - remove a random consonant: delete exactly one consonant letter
+            - delete a random letter: delete exactly one letter (any)
+            - replace random vowel with a different vowel: replace exactly one vowel letter with a different vowel
+            - replace random consonant with a different consonant: replace exactly one consonant letter with a different consonant
+            - replace double letters with a single letter: remove exactly one character from a double-letter run (length decreases by 1 at that spot)
+            - swap adjacent consonants: swap exactly one eligible adjacent consonant pair (length unchanged)
+            - abbreviate name parts: keep part count; each part shorter but still starts with the original part
+            - convert name to initials: output initials for all parts (e.g., "JD" or "J.D" style; periods optional)
+            - use first name initial with last name: first part becomes an initial, rest unchanged
+            - replace spaces with special characters: output with NO spaces; replace each original space with ONE non-space special character (prefer `_` or similar; never use comma)
+            - add a title prefix: prepend ONE of: Mr, Mrs, Ms, Miss, Dr, Prof, Sir, Lady, Lord, Dame, Master, Mistress
+            - add a title suffix: append ONE of: Jr, Sr, III, IV, V, PhD, MD (avoid title forms that require punctuation)
+            - remove title: if the seed has a title from the prefix list above, remove it
+            - remove a random special character: if the seed contains a removable special character, remove exactly one such character
+            8. If the TASK includes phonetic/orthographic Light/Medium/Far distributions:
+            - prioritize generating plausible names that match the requested similarity levels.
+            - overall distribution should be approximately respected across the {target_count} outputs.
+        """
 
         # Use Ollama to query the LLM
         try:
@@ -1791,7 +2662,7 @@ OUTPUT RULES (STRICT):
 
         for i in range(1, len(responds)):
             try:
-                llm_respond = self.Process_function(responds[i], False)
+                llm_respond = self.Process_function(responds[i], False, query_template=query_template)
                 seed_name = llm_respond[0]
 
                 matched_seed_name, matching_identity = self._resolve_identity_match(
@@ -1800,6 +2671,18 @@ OUTPUT RULES (STRICT):
                     identity_by_normalized_name,
                     identity_candidates,
                 )
+
+                if matching_identity is None and (i - 1) < len(identity_list):
+                    positional_identity = identity_list[i - 1]
+                    if positional_identity:
+                        positional_seed = str(positional_identity[0]).strip() if len(positional_identity) > 0 else ""
+                        if positional_seed:
+                            bt.logging.info(
+                                f"Identity positional fallback matched '{seed_name}' -> '{positional_seed}' (response_index={i})"
+                            )
+                            matched_seed_name = positional_seed
+                            matching_identity = positional_identity
+
                 if matching_identity is None:
                     bt.logging.warning(f"Could not find identity for name {seed_name}")
                     self._increment_fail_reason(run_fail_reasons, "identity_match_miss")
@@ -1949,7 +2832,13 @@ OUTPUT RULES (STRICT):
         
         return payload.strip()
 
-    def validate_variation(self, name: str, seed: str, is_multipart_name: bool) -> str:
+    def validate_variation(
+        self,
+        name: str,
+        seed: str,
+        is_multipart_name: bool,
+        requested_rules: Optional[List[str]] = None,
+    ) -> str:
         """
         Helper function to validate if a variation matches the seed name structure.
 
@@ -1965,7 +2854,8 @@ OUTPUT RULES (STRICT):
         if not name or name.isspace():
             return np.nan
 
-        # Handle cases with colons (e.g., "Here are variations: Name")
+        requested_rules = requested_rules or []
+
         if ":" in name:
             name = name.split(":")[-1].strip()
 
@@ -1973,13 +2863,12 @@ OUTPUT RULES (STRICT):
         if not name:
             return np.nan
 
-        # Guard against malformed long strings / payload leaks.
         if len(name) > max(2 * len(seed), 64):
             return np.nan
 
         name_parts = name.split()
         if is_multipart_name:
-            if len(name_parts) < 2:
+            if len(name_parts) < 2 and not self._query_allows_structure_breaks(seed, requested_rules):
                 bt.logging.warning(f"Skipping single-part variation '{name}' for multi-part seed '{seed}'")
                 return np.nan
         else:
@@ -1987,12 +2876,17 @@ OUTPUT RULES (STRICT):
                 bt.logging.warning(f"Skipping multi-part variation '{name}' for single-part seed '{seed}'")
                 return np.nan
 
-        if not self._is_name_like_candidate(name, seed, is_multipart_name):
+        if not self._is_name_like_candidate(
+            name,
+            seed,
+            is_multipart_name,
+            requested_rules=requested_rules,
+        ):
             return np.nan
 
         return name
 
-    def Process_function(self, string: str, debug: bool) -> Tuple[str, str, List[str], Optional[str]]:
+    def Process_function(self, string: str, debug: bool, query_template: str = "") -> Tuple[str, str, List[str], Optional[str]]:
         """
         Process the LLM response to extract the seed name and variations.
         
@@ -2023,11 +2917,22 @@ OUTPUT RULES (STRICT):
         """
         # Split the response by "---" to extract the query and response parts
         splits = string.split('---')
-        
-        # Extract and analyze the seed name structure
-        seed = splits[1].split("-")[1].replace(".", "").replace(",", "").replace("'", "")
+        if len(splits) < 2:
+            raise ValueError("Malformed LLM response payload: missing query separator")
+
+        # Extract and analyze the seed name structure.
+        query_line = str(splits[1] or "").strip()
+        if "Query-" in query_line:
+            seed_raw = query_line.split("Query-", 1)[1]
+        elif "-" in query_line:
+            seed_raw = query_line.split("-", 1)[1]
+        else:
+            seed_raw = query_line
+
+        seed = seed_raw.replace(".", "").replace(",", "").replace("'", "")
         seed_parts = seed.split()
         is_multipart_name = len(seed_parts) > 1
+        requested_rules = self._extract_requested_transformations(query_template)
         seed = self.Clean_extra(seed, True, True, True, preserve_name_spaces=is_multipart_name)
         
         bt.logging.info(f"Processing seed name: '{seed}' (multipart: {is_multipart_name})")
@@ -2047,7 +2952,7 @@ OUTPUT RULES (STRICT):
             # Split by comma and process each variation
             variations = []
             for name in payload.split(","):
-                cleaned_var = self.validate_variation(name, seed, is_multipart_name)
+                cleaned_var = self.validate_variation(name, seed, is_multipart_name, requested_rules=requested_rules)
                 if not pd.isna(cleaned_var):
                     variations.append(cleaned_var)
             
@@ -2070,7 +2975,7 @@ OUTPUT RULES (STRICT):
                 # Process line-separated variations
                 variations = []
                 for name in payload.split("\\n"):
-                    cleaned_var = self.validate_variation(name, seed, is_multipart_name)
+                    cleaned_var = self.validate_variation(name, seed, is_multipart_name, requested_rules=requested_rules)
                     if not pd.isna(cleaned_var):
                         variations.append(cleaned_var)
             
@@ -2101,7 +3006,7 @@ OUTPUT RULES (STRICT):
                         if ":" in part:  # New variation starts after colon
                             if current_variation:
                                 # Process completed variation
-                                cleaned_var = self.validate_variation(" ".join(current_variation), seed, is_multipart_name)
+                                cleaned_var = self.validate_variation(" ".join(current_variation), seed, is_multipart_name, requested_rules=requested_rules)
                                 if not pd.isna(cleaned_var):
                                     variations.append(cleaned_var)
                             current_variation = [part.split(":")[-1].strip()]
@@ -2109,20 +3014,20 @@ OUTPUT RULES (STRICT):
                             current_variation.append(part)
                             # Check if we have collected enough parts for a complete name
                             if len(current_variation) == len(seed_parts):
-                                cleaned_var = self.validate_variation(" ".join(current_variation), seed, is_multipart_name)
+                                cleaned_var = self.validate_variation(" ".join(current_variation), seed, is_multipart_name, requested_rules=requested_rules)
                                 if not pd.isna(cleaned_var):
                                     variations.append(cleaned_var)
                                 current_variation = []
                 
                     # Handle any remaining parts
                     if current_variation:
-                        cleaned_var = self.validate_variation(" ".join(current_variation), seed, is_multipart_name)
+                        cleaned_var = self.validate_variation(" ".join(current_variation), seed, is_multipart_name, requested_rules=requested_rules)
                         if not pd.isna(cleaned_var):
                             variations.append(cleaned_var)
                 else:
                     # For single-part names, simple space splitting is sufficient
                     for name in payload.split():
-                        cleaned_var = self.validate_variation(name, seed, is_multipart_name)
+                        cleaned_var = self.validate_variation(name, seed, is_multipart_name, requested_rules=requested_rules)
                         if not pd.isna(cleaned_var):
                             variations.append(cleaned_var)
                 

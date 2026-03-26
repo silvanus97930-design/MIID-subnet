@@ -24,6 +24,39 @@ except ImportError:
 DRAND_QUICKNET_PK = "83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a"
 
 
+def _bytes_to_timelock_message(data: bytes) -> str:
+    """Convert arbitrary bytes to a timelock-compatible string losslessly.
+
+    The currently published timelock python binding calls `str.encode(message)`
+    internally, so passing bytes raises a TypeError. latin1 gives a 1:1 mapping
+    for byte values 0..255 and round-trips safely.
+    """
+    return data.decode("latin1")
+
+
+def _timelock_message_to_bytes(message: object) -> bytes:
+    """Convert timelock plaintext outputs back to bytes."""
+    if isinstance(message, bytes):
+        return message
+    if isinstance(message, bytearray):
+        return bytes(message)
+    if isinstance(message, str):
+        return message.encode("latin1")
+    raise TypeError(f"Unexpected timelock plaintext type: {type(message)}")
+
+
+def _timelock_cipher_to_bytes(ciphertext: object) -> bytes:
+    """Normalize timelock ciphertext return types to bytes."""
+    if isinstance(ciphertext, bytes):
+        return ciphertext
+    if isinstance(ciphertext, bytearray):
+        return bytes(ciphertext)
+    if isinstance(ciphertext, str):
+        # Some wrappers may emit string payloads.
+        return ciphertext.encode("latin1")
+    raise TypeError(f"Unexpected timelock ciphertext type: {type(ciphertext)}")
+
+
 def encrypt_for_drand(data: bytes, target_round: int) -> bytes:
     """Encrypt data with drand timelock.
 
@@ -54,14 +87,18 @@ def encrypt_for_drand(data: bytes, target_round: int) -> bytes:
     # Generate ephemeral secret key for this encryption
     ephemeral_sk = bytearray(secrets.token_bytes(32))
 
+    # timelock binding currently expects message as str; convert losslessly.
+    message = _bytes_to_timelock_message(data)
+
     # Encrypt for the target round
-    ciphertext = tlock.tle(target_round, data, ephemeral_sk)
+    ciphertext = tlock.tle(int(target_round), message, ephemeral_sk)
+    ciphertext_bytes = _timelock_cipher_to_bytes(ciphertext)
 
     bt.logging.debug(
         f"Encrypted {len(data)} bytes for drand round {target_round}"
     )
 
-    return ciphertext
+    return ciphertext_bytes
 
 
 def decrypt_with_drand(encrypted_data: bytes, drand_signature: bytes) -> bytes:
@@ -88,10 +125,11 @@ def decrypt_with_drand(encrypted_data: bytes, drand_signature: bytes) -> bytes:
 
     tlock = Timelock(DRAND_QUICKNET_PK)
     plaintext = tlock.tld(encrypted_data, drand_signature)
+    plaintext_bytes = _timelock_message_to_bytes(plaintext)
 
-    bt.logging.debug(f"Decrypted {len(plaintext)} bytes")
+    bt.logging.debug(f"Decrypted {len(plaintext_bytes)} bytes")
 
-    return plaintext
+    return plaintext_bytes
 
 
 def encrypt_image_for_drand(

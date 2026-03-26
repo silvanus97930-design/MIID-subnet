@@ -5,40 +5,23 @@ Face identity comparison using AdaFace.
 This module is used by the miner to validate that generated image variations
 preserve the identity of the original face. It loads a pretrained AdaFace model
 (ir_50 on MS1MV2), extracts normalized face embeddings via MTCNN alignment,
-and compares embeddings using cosine similarity. A variation is considered
-identity-preserving if similarity is at or above the threshold (default 0.7).
-
-  - validate_single_variation(base_image, variation_image, model=None, min_similarity=0.7, device='cpu') -> bool
-  - compare_faces(original_image_path, variation_image_paths, model=None, device='cpu') -> dict
-
-Prerequisites:
-  1. Clone the AdaFace repository:
-     git clone https://github.com/mk-minchul/AdaFace.git MIID/miner/AdaFace
-
-  2. Install dependencies (if not already installed):
-     pip install opencv-python torch pillow numpy
-
-  3. Download a pretrained AdaFace model from:
-     https://github.com/mk-minchul/AdaFace#pretrained-models
-     Recommended: ir_50 model trained on MS1MV2
-
-  4. Place the model file at:
-     MIID/miner/AdaFace/pretrained/adaface_ir50_ms1mv2.ckpt
+and compares embeddings using cosine similarity.
 """
 
 import importlib.util
 import os
 import sys
-import tempfile
 import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Iterable, List, Optional
 
 import numpy as np
 import torch
 from PIL import Image
 
 # Check for required dependencies
-import cv2
+import cv2  # noqa: F401
 
 # Add AdaFace to path (relative to this file)
 _this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -54,6 +37,7 @@ if os.path.isdir(ADA_FACE_PATH):
 
 _MODEL_CACHE_LOCK = threading.Lock()
 _MODEL_CACHE = {}
+_MTCNN_LOCK = threading.Lock()
 
 
 def _resolve_device(device: str | None = None) -> str:
@@ -105,7 +89,7 @@ try:
 
     from inference import load_pretrained_model, to_input
 
-    # Override the hardcoded CUDA device in align.py
+    # Initialize with a safe default.
     align_device = "cuda:0" if torch.cuda.is_available() else "cpu"
     align.mtcnn_model = mtcnn.MTCNN(device=align_device, crop_size=(112, 112))
 
@@ -114,6 +98,30 @@ except ImportError as e:
         f"AdaFace modules could not be imported: {e}. "
         f"Ensure AdaFace is cloned at {ADA_FACE_PATH} and local modules are available."
     ) from e
+
+
+def _ensure_mtcnn_model(resolved_device: str) -> None:
+    """Ensure align.mtcnn_model matches requested device."""
+    target_device = "cuda:0" if resolved_device.startswith("cuda") and torch.cuda.is_available() else "cpu"
+
+    with _MTCNN_LOCK:
+        current = getattr(align, "mtcnn_model", None)
+        current_device = str(getattr(current, "device", "")) if current is not None else ""
+        if current is None or current_device != target_device:
+            align.mtcnn_model = mtcnn.MTCNN(device=target_device, crop_size=(112, 112))
+
+
+def _to_rgb_pil_image(image_input: Any) -> Image.Image:
+    """Convert path/PIL input into an RGB PIL image."""
+    if isinstance(image_input, Image.Image):
+        return image_input.convert("RGB")
+
+    if isinstance(image_input, str):
+        if not os.path.isfile(image_input):
+            raise FileNotFoundError(f"Image path not found: {image_input}")
+        return Image.open(image_input).convert("RGB")
+
+    raise TypeError("Image input must be a file path (str) or PIL Image")
 
 
 def load_adaface_model(architecture='ir_50', model_path=None, device='cpu'):
@@ -132,11 +140,11 @@ def load_adaface_model(architecture='ir_50', model_path=None, device='cpu'):
 
     resolved_device = _resolve_device(device)
 
-    # Set default model path to absolute path if not provided
+    # Set default model path to absolute path if not provided.
     if model_path is None:
         model_path = os.path.join(ADA_FACE_PATH, "pretrained", "adaface_ir50_ms1mv2.ckpt")
 
-    # Convert to absolute path if it's relative
+    # Convert to absolute path if it's relative.
     if not os.path.isabs(model_path):
         model_path = os.path.join(ADA_FACE_PATH, model_path)
 
@@ -148,10 +156,10 @@ def load_adaface_model(architecture='ir_50', model_path=None, device='cpu'):
     if cached is not None:
         return cached
 
-    # Update the model path in inference module
+    # Update the model path in inference module.
     inference.adaface_models[architecture] = model_path
 
-    # Verify file exists
+    # Verify file exists.
     if not os.path.exists(model_path):
         raise FileNotFoundError(
             f"Model file not found: {model_path}\n"
@@ -170,7 +178,7 @@ def load_adaface_model(architecture='ir_50', model_path=None, device='cpu'):
             kwargs['weights_only'] = False  # Required for PyTorch 2.6+ with checkpoint files
         return original_load(*args, **kwargs)
 
-    # Monkey patch torch.load for this call
+    # Monkey patch torch.load for this call.
     torch.load = cpu_load
 
     try:
@@ -180,9 +188,13 @@ def load_adaface_model(architecture='ir_50', model_path=None, device='cpu'):
 
     model.eval()
 
-    # Move model to device
+    # Move model to target device.
     if resolved_device.startswith('cuda') and torch.cuda.is_available():
         model = model.cuda()
+    else:
+        model = model.cpu()
+
+    _ensure_mtcnn_model(resolved_device)
 
     print("✓ Model loaded successfully")
 
@@ -192,50 +204,101 @@ def load_adaface_model(architecture='ir_50', model_path=None, device='cpu'):
     return model
 
 
-def extract_face_embedding(model, image_path, device='cpu'):
+def _extract_aligned_face(image_input: Any, device: str) -> Optional[Image.Image]:
+    """Align one face from input image using AdaFace MTCNN."""
+    try:
+        rgb_image = _to_rgb_pil_image(image_input)
+        _ensure_mtcnn_model(device)
+        aligned_rgb_img = align.get_aligned_face("", rgb_pil_image=rgb_image)
+        if aligned_rgb_img is None:
+            return None
+        return aligned_rgb_img
+    except Exception:
+        return None
+
+
+def extract_face_embeddings(
+    model,
+    images: Iterable[Any],
+    device: str = 'cpu',
+    parallel_workers: Optional[int] = None,
+) -> List[Optional[torch.Tensor]]:
     """
-    Extract face embedding from an image using AdaFace.
+    Extract normalized AdaFace embeddings for a list of images.
+
+    - Alignment runs in-memory (no temporary files).
+    - Model inference is batched in a single forward pass when possible.
+    """
+    resolved_device = _resolve_device(device)
+    image_list = list(images)
+    if not image_list:
+        return []
+
+    if resolved_device.startswith('cuda') and torch.cuda.is_available():
+        model = model.cuda()
+    else:
+        model = model.cpu()
+
+    workers_env = int(os.environ.get("ADAFACE_ALIGN_WORKERS", "0") or 0)
+    workers = int(parallel_workers if parallel_workers is not None else workers_env)
+    workers = max(0, workers)
+
+    if workers > 1 and len(image_list) > 1:
+        max_workers = min(workers, len(image_list))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            aligned_faces = list(executor.map(lambda img: _extract_aligned_face(img, resolved_device), image_list))
+    else:
+        aligned_faces = [_extract_aligned_face(img, resolved_device) for img in image_list]
+
+    tensors: List[torch.Tensor] = []
+    indices: List[int] = []
+
+    for idx, aligned in enumerate(aligned_faces):
+        if aligned is None:
+            continue
+        try:
+            tensors.append(to_input(aligned))
+            indices.append(idx)
+        except Exception:
+            continue
+
+    outputs: List[Optional[torch.Tensor]] = [None] * len(image_list)
+    if not tensors:
+        return outputs
+
+    batch = torch.cat(tensors, dim=0)
+
+    if resolved_device.startswith('cuda') and torch.cuda.is_available():
+        batch = batch.cuda(non_blocking=True)
+
+    try:
+        with torch.no_grad():
+            features, _ = model(batch)
+        features = features / torch.norm(features, 2, dim=1, keepdim=True)
+        features = features.detach().cpu()
+    except Exception:
+        return outputs
+
+    for row, idx in enumerate(indices):
+        outputs[idx] = features[row:row + 1]
+
+    return outputs
+
+
+def extract_face_embedding(model, image_input, device='cpu'):
+    """
+    Extract face embedding from one image using AdaFace.
 
     Args:
         model: AdaFace model
-        image_path: Path to image file
+        image_input: Path to image file or PIL image
         device: Device to run inference on ('cpu' or 'cuda')
 
     Returns:
         Face embedding tensor (normalized) or None if face detection fails
     """
-    resolved_device = _resolve_device(device)
-
-    try:
-        # Align face using MTCNN
-        aligned_rgb_img = align.get_aligned_face(image_path)
-
-        if aligned_rgb_img is None:
-            print(f"⚠ Warning: Face detection failed for {image_path}")
-            return None
-
-        # Convert to BGR tensor input (AdaFace expects BGR)
-        bgr_input = to_input(aligned_rgb_img)
-
-        # Move to device
-        if resolved_device.startswith('cuda') and torch.cuda.is_available():
-            bgr_input = bgr_input.cuda()
-            model = model.cuda()
-
-        # Extract feature embedding
-        with torch.no_grad():
-            feature, norm = model(bgr_input)
-
-        # Normalize feature
-        feature = feature / torch.norm(feature, 2, dim=1, keepdim=True)
-
-        return feature.cpu()
-
-    except Exception as e:
-        print(f"✗ Error processing {image_path}: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+    embeddings = extract_face_embeddings(model, [image_input], device=device, parallel_workers=0)
+    return embeddings[0] if embeddings else None
 
 
 def compute_cosine_similarity(embedding1, embedding2):
@@ -252,40 +315,49 @@ def compute_cosine_similarity(embedding1, embedding2):
     if embedding1 is None or embedding2 is None:
         return None
 
-    # Compute cosine similarity
     similarity = torch.mm(embedding1, embedding2.t()).item()
-
-    # Clamp to [0, 1] range (though cosine similarity is typically [-1, 1])
-    # For face recognition, we usually expect positive similarities
     similarity = max(0.0, similarity)
-
     return similarity
 
 
-def _path_from_image(img):
-    """Return (path, cleanup_path). If img is a path str, return (img, None). If PIL Image, write to temp file and return (path, path)."""
-    if isinstance(img, str) and os.path.isfile(img):
-        return img, None
-    if isinstance(img, Image.Image):
-        f = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        img.save(f.name, format="PNG")
-        return f.name, f.name
-    raise TypeError("base_image and variation_image must be a file path (str) or PIL Image")
+def score_variation_candidates(
+    base_image,
+    variation_images: List[Any],
+    model=None,
+    device='cpu',
+    parallel_workers: Optional[int] = None,
+    base_embedding: Optional[torch.Tensor] = None,
+) -> List[Optional[float]]:
+    """Score variation candidates against the base image using AdaFace cosine similarity."""
+    resolved_device = _resolve_device(device)
 
+    if model is None:
+        model = load_adaface_model(device=resolved_device)
 
-def _cleanup_temp_file(path: str | None) -> None:
-    if not path:
-        return
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
+    if base_embedding is None:
+        base_embedding = extract_face_embedding(model, base_image, device=resolved_device)
+
+    if base_embedding is None:
+        return [None] * len(variation_images)
+
+    var_embeddings = extract_face_embeddings(
+        model,
+        variation_images,
+        device=resolved_device,
+        parallel_workers=parallel_workers,
+    )
+
+    scores: List[Optional[float]] = []
+    for emb in var_embeddings:
+        score = compute_cosine_similarity(base_embedding, emb)
+        scores.append(float(score) if score is not None else None)
+
+    return scores
 
 
 def validate_single_variation(base_image, variation_image, model=None, min_similarity=0.7, device='cpu'):
     """
     Validate that a single variation image preserves the identity of the base face.
-    Used by image_generator.validate_variation and by the miner to filter variations.
 
     Args:
         base_image: Original face image as file path (str) or PIL Image
@@ -295,21 +367,18 @@ def validate_single_variation(base_image, variation_image, model=None, min_simil
         device: Device to run inference on ('cpu' or 'cuda')
 
     Returns:
-        True if similarity >= min_similarity, False otherwise (or if embedding extraction fails)
+        True if similarity >= min_similarity, False otherwise.
     """
     resolved_device = _resolve_device(device)
-    base_path, base_cleanup = _path_from_image(base_image)
-    var_path, var_cleanup = _path_from_image(variation_image)
-
-    try:
-        results = compare_faces(base_path, [var_path], model=model, device=resolved_device)
-        similarity = results.get(var_path)
-        if similarity is None:
-            return False
-        return similarity >= min_similarity
-    finally:
-        _cleanup_temp_file(base_cleanup)
-        _cleanup_temp_file(var_cleanup)
+    scores = score_variation_candidates(
+        base_image,
+        [variation_image],
+        model=model,
+        device=resolved_device,
+        parallel_workers=0,
+    )
+    similarity = scores[0] if scores else None
+    return bool(similarity is not None and similarity >= min_similarity)
 
 
 def compare_faces(original_image_path, variation_image_paths, model=None, device='cpu'):
@@ -317,48 +386,29 @@ def compare_faces(original_image_path, variation_image_paths, model=None, device
     Compare original face with variation faces.
 
     Args:
-        original_image_path: Path to original face image
-        variation_image_paths: List of paths to variation images
+        original_image_path: Path to original face image or PIL image
+        variation_image_paths: List of paths/PIL images for variation images
         model: AdaFace model (if None, will be loaded)
         device: Device to run inference on
 
     Returns:
-        Dictionary mapping variation paths to similarity scores
+        Dictionary mapping variation input identifiers to similarity scores
     """
     resolved_device = _resolve_device(device)
 
-    # Load model if not provided
     if model is None:
         model = load_adaface_model(device=resolved_device)
-        # Initialize MTCNN if not already done
-        if not hasattr(align, 'mtcnn_model') or align.mtcnn_model is None:
-            mtcnn_device = 'cuda:0' if resolved_device.startswith('cuda') and torch.cuda.is_available() else 'cpu'
-            align.mtcnn_model = align.mtcnn.MTCNN(device=mtcnn_device, crop_size=(112, 112))
 
-    print(f"\nExtracting embedding from original image: {original_image_path}")
-    original_embedding = extract_face_embedding(model, original_image_path, device=resolved_device)
+    scores = score_variation_candidates(
+        original_image_path,
+        list(variation_image_paths),
+        model=model,
+        device=resolved_device,
+    )
 
-    if original_embedding is None:
-        print("✗ Failed to extract embedding from original image. Cannot proceed.")
-        return {}
-
-    print("✓ Original embedding extracted")
-
-    # Compare with each variation
     results = {}
-
-    for var_path in variation_image_paths:
-        print(f"\nProcessing variation: {var_path}")
-        var_embedding = extract_face_embedding(model, var_path, device=resolved_device)
-
-        if var_embedding is None:
-            print(f"⚠ Skipping {var_path} - face detection failed")
-            results[var_path] = None
-            continue
-
-        similarity = compute_cosine_similarity(original_embedding, var_embedding)
-        results[var_path] = similarity
-
-        print(f"✓ Similarity score: {similarity:.4f}")
+    for variation_input, score in zip(variation_image_paths, scores):
+        key = variation_input if isinstance(variation_input, str) else repr(variation_input)
+        results[key] = score
 
     return results

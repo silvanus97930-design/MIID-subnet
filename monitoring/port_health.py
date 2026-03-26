@@ -100,8 +100,26 @@ def check_public_port_with_yougetsignal(
             body = response.read(12_000).decode("utf-8", errors="replace")
     except Exception as exc:
         return None, f"external_check_failed: {exc}"
-
     low = body.lower()
+
+    if "daily open port check limit reached" in low or "limit reached for" in low:
+        # Best-effort fallback: probe the configured public target directly from host/container.
+        # Success here strongly suggests reachability even when the external checker is rate-limited.
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(max(0.5, float(timeout_seconds)))
+            sock.connect((ip, int(port)))
+            return True, "external checker rate-limited; self-probe to target succeeded"
+        except Exception:
+            return None, "external checker rate-limited (yougetsignal daily limit reached)"
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
     if " is open on " in low or "flag_green" in low:
         return True, "external checker reports OPEN"
     if " is closed on " in low or "flag_red" in low:
