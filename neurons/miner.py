@@ -50,8 +50,13 @@ different runs and facilitate analysis of results over time.
 import time
 import typing
 import io
+import subprocess
 import random
 import re
+import threading
+import unicodedata
+import json
+import hashlib
 from difflib import SequenceMatcher
 import bittensor as bt
 import ollama
@@ -60,7 +65,7 @@ import os
 import numpy as np
 from typing import List, Dict, Tuple, Any, Optional
 from datetime import datetime, timedelta
-from collections import defaultdict
+from collections import Counter, defaultdict
 from tqdm import tqdm
 from PIL import Image
 
@@ -78,7 +83,12 @@ from MIID.base.miner import BaseMinerNeuron
 from bittensor.core.errors import NotVerifiedException
 
 # Phase 4 imports
-from MIID.miner.image_generator import decode_base_image, generate_variations, validate_variation
+from MIID.miner.image_generator import (
+    decode_base_image,
+    generate_variations,
+    validate_variation,
+    prewarm_flux_pipeline,
+)
 from MIID.miner.drand_encrypt import encrypt_image_for_drand, is_timelock_available
 from MIID.miner.s3_upload import upload_to_s3
 
@@ -156,6 +166,13 @@ class Miner(BaseMinerNeuron):
         "Oak", "Maple", "Cedar", "Pine", "River", "Hill", "Market", "Liberty",
         "Central", "Park", "Garden", "Lake", "Harbor", "Sunrise", "West", "East",
     ]
+
+    NON_NAME_TOKENS = {
+        "street", "st", "avenue", "ave", "road", "rd", "boulevard", "blvd",
+        "lane", "drive", "district", "quarter", "ward", "center", "commons",
+        "city", "state", "province", "country", "postal", "zip", "code",
+        "address", "region", "unknown", "none", "null",
+    }
 
     def _register_dynamic_validator(self, hotkey: str) -> bool:
         """Allow any currently validator-permitted hotkey from metagraph."""
@@ -267,20 +284,120 @@ class Miner(BaseMinerNeuron):
         """Parse expected variation count from validator query text."""
         if not query_template:
             return default
+
+        text = str(query_template)
+        candidates: List[int] = []
         patterns = [
             r"\bexact(?:ly)?\s+(\d{1,2})\s+variations?\b",
-            r"\bgenerate\s+(\d{1,2})\s+variations?\b",
-            r"\btotal\s+(\d{1,2})\s+variations?\b",
+            r"\bgenerate(?:\s+exactly)?\s+(\d{1,2})\s+variations?\b",
+            r"\btotal(?:\s+of)?\s+(\d{1,2})\s+variations?\b",
+            r"\bexact\s+number\s+of\s+variations?\s*[:=]?\s*(\d{1,2})\b",
+            r"\bvariation[_\s-]*count\s*[:=]?\s*(\d{1,2})\b",
+            r'"variation_count"\s*:\s*(\d{1,2})',
+            r'"count"\s*:\s*(\d{1,2})',
+            r"\b(\d{1,2})\s+variations?\b",
         ]
         for pattern in patterns:
-            match = re.search(pattern, query_template, flags=re.IGNORECASE)
-            if match:
+            for match in re.finditer(pattern, text, flags=re.IGNORECASE):
                 try:
                     value = int(match.group(1))
-                    return max(4, min(20, value))
                 except Exception:
                     continue
-        return default
+                if 4 <= value <= 20:
+                    candidates.append(value)
+
+        if not candidates:
+            return default
+        return Counter(candidates).most_common(1)[0][0]
+
+    def _extract_rule_percentage(self, query_template: str, default: float = 0.0) -> float:
+        """Extract the target percentage of rule-based variations from query text."""
+        if not query_template:
+            return default
+        lowered = str(query_template).lower()
+        candidates: List[int] = []
+        for match in re.finditer(r"(\d{1,3})\s*%", lowered):
+            try:
+                pct = int(match.group(1))
+            except Exception:
+                continue
+            if pct < 0 or pct > 100:
+                continue
+            window = lowered[max(0, match.start() - 48): min(len(lowered), match.end() + 96)]
+            if any(token in window for token in ("rule", "transform", "variation")):
+                candidates.append(pct)
+        if not candidates:
+            return default
+        pct = Counter(candidates).most_common(1)[0][0]
+        return max(0.0, min(0.9, pct / 100.0))
+
+    def _extract_requested_transformations(self, query_template: str) -> List[str]:
+        """Infer requested transformation types from natural-language or snake_case rules."""
+        lowered = str(query_template or "").lower()
+        if not lowered.strip():
+            return []
+
+        rules: List[str] = []
+
+        def add_rule(name: str) -> None:
+            if name not in rules:
+                rules.append(name)
+
+        if re.search(r"\binsert[_\s-]*random[_\s-]*letter\b", lowered) or ("insert" in lowered and "letter" in lowered):
+            add_rule("insert_random_letter")
+        if re.search(r"\bswap[_\s-]*adjacent[_\s-]*(?:syllables?|letters?)\b", lowered) or ("swap" in lowered and "adjacent" in lowered):
+            add_rule("swap_adjacent_syllables")
+        if re.search(r"\bdelete[_\s-]*random[_\s-]*letter\b", lowered) or ("delete" in lowered and "letter" in lowered):
+            add_rule("delete_random_letter")
+        if re.search(r"\bremove[_\s-]*random[_\s-]*vowel\b", lowered) or ("remove" in lowered and "vowel" in lowered):
+            add_rule("remove_random_vowel")
+        if re.search(r"\bremove[_\s-]*random[_\s-]*consonant\b", lowered) or ("remove" in lowered and "consonant" in lowered):
+            add_rule("remove_random_consonant")
+        if re.search(r"\bduplicate[_\s-]*random[_\s-]*letter\b", lowered) or ("duplicate" in lowered and "letter" in lowered):
+            add_rule("duplicate_random_letter_as_double_letter")
+        if re.search(r"\babbreviat|abbreviate_name_parts|shorten[_\s-]*name[_\s-]*to[_\s-]*abbreviations\b", lowered):
+            add_rule("shorten_name_to_abbreviations")
+        if re.search(r"\bname[_\s-]*parts[_\s-]*permut", lowered) or ("permute" in lowered and "name" in lowered):
+            add_rule("name_parts_permutations")
+
+        # If a rule percentage is specified but specific rules are phrased loosely,
+        # use a safe default trio of letter-only transforms.
+        if not rules and ("rule-based" in lowered or "transform" in lowered):
+            return [
+                "insert_random_letter",
+                "swap_adjacent_syllables",
+                "shorten_name_to_abbreviations",
+            ]
+        return rules
+
+    @staticmethod
+    def _normalize_name_text(raw_name: str) -> str:
+        """Unicode-normalize and keep name-like text only."""
+        normalized = unicodedata.normalize("NFKC", str(raw_name or ""))
+        normalized = normalized.replace("’", "'").replace("`", "'").replace("´", "'")
+        cleaned = "".join(
+            ch if (ch.isalpha() or ch.isspace() or ch in {"'", "-"}) else " "
+            for ch in normalized
+        )
+        cleaned = cleaned.replace("-", " ").replace("'", " ")
+        return " ".join(cleaned.split()).strip()
+
+    @staticmethod
+    def _canonical_name_key(raw_name: str) -> str:
+        normalized = Miner._normalize_name_text(raw_name)
+        if not normalized:
+            return ""
+        decomposed = unicodedata.normalize("NFKD", normalized)
+        without_marks = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+        return " ".join(without_marks.casefold().split())
+
+    @staticmethod
+    def _token_overlap_ratio(left: str, right: str) -> float:
+        left_tokens = {token for token in left.split() if token}
+        right_tokens = {token for token in right.split() if token}
+        if not left_tokens or not right_tokens:
+            return 0.0
+        return len(left_tokens & right_tokens) / float(max(len(left_tokens), len(right_tokens)))
 
     @staticmethod
     def _compact_text(value: str) -> str:
@@ -289,20 +406,135 @@ class Miner(BaseMinerNeuron):
         compact = compact.replace("federation", "").replace("democratic", "").replace("islamic", "")
         return compact
 
+    def _is_geo_or_noise_token(self, token: str, seed_tokens: set[str]) -> bool:
+        lowered = token.casefold().strip()
+        if not lowered:
+            return True
+        if lowered in seed_tokens:
+            return False
+        if lowered in self.NON_NAME_TOKENS:
+            return True
+        if lowered in self.COUNTRY_ALIASES:
+            return True
+
+        country_map = getattr(self, "_country_name_to_code", {}) or {}
+        if lowered in country_map:
+            return True
+
+        country_compact = getattr(self, "_country_compact_to_code", {}) or {}
+        if self._compact_text(lowered) in country_compact:
+            return True
+
+        return False
+
+    def _is_name_like_candidate(self, candidate: str, seed_name: str, is_multipart: bool) -> bool:
+        candidate_norm = self._normalize_name_text(candidate)
+        seed_norm = self._normalize_name_text(seed_name)
+        if not candidate_norm or not seed_norm:
+            return False
+
+        candidate_key = self._canonical_name_key(candidate_norm)
+        seed_key = self._canonical_name_key(seed_norm)
+        if not candidate_key or candidate_key == seed_key:
+            return False
+
+        candidate_parts = candidate_norm.split()
+        seed_parts = seed_norm.split()
+
+        if is_multipart:
+            if len(candidate_parts) < 2:
+                return False
+            if len(candidate_parts) > max(len(seed_parts) + 1, 4):
+                return False
+        else:
+            if len(candidate_parts) != 1:
+                return False
+
+        seed_tokens = set(seed_key.split())
+        allowed_initials = {token[0] for token in seed_tokens if token}
+        for part in candidate_parts:
+            if any(ch.isdigit() for ch in part):
+                return False
+            if len(part) > 36:
+                return False
+            if len(part) == 1 and part.casefold() not in allowed_initials:
+                return False
+            if self._is_geo_or_noise_token(part, seed_tokens):
+                return False
+
+        dedup_parts = {part.casefold() for part in candidate_parts if part.strip()}
+        if len(candidate_parts) > 1 and len(dedup_parts) == 1:
+            return False
+
+        similarity = SequenceMatcher(None, seed_key, candidate_key).ratio()
+        if is_multipart and similarity < 0.40:
+            return False
+        if not is_multipart and similarity < 0.30:
+            return False
+
+        return True
+
+    def _resolve_identity_match(
+        self,
+        seed_name: str,
+        identity_by_name: Dict[str, List[str]],
+        identity_by_normalized_name: Dict[str, List[str]],
+        identity_candidates: List[Tuple[str, str, List[str]]],
+    ) -> Tuple[Optional[str], Optional[List[str]]]:
+        direct = identity_by_name.get(seed_name)
+        if direct is not None:
+            return seed_name, direct
+
+        normalized_seed = self._normalize_name_text(seed_name)
+        if normalized_seed:
+            normalized_match = identity_by_normalized_name.get(normalized_seed)
+            if normalized_match is not None:
+                canonical_name = str(normalized_match[0]).strip() if normalized_match else seed_name
+                return canonical_name, normalized_match
+
+        canonical_seed = self._canonical_name_key(seed_name)
+        if not canonical_seed:
+            return None, None
+
+        fuzzy_rows: List[Tuple[float, float, float, str, List[str]]] = []
+        sorted_seed = " ".join(sorted(canonical_seed.split()))
+
+        for candidate_name, candidate_key, identity in identity_candidates:
+            if not candidate_key:
+                continue
+            seq_score = SequenceMatcher(None, canonical_seed, candidate_key).ratio()
+            sorted_candidate = " ".join(sorted(candidate_key.split()))
+            sort_score = SequenceMatcher(None, sorted_seed, sorted_candidate).ratio()
+            overlap = self._token_overlap_ratio(canonical_seed, candidate_key)
+            score = max(seq_score, sort_score * 0.96 + overlap * 0.04, (seq_score + overlap) / 2.0)
+            fuzzy_rows.append((score, seq_score, overlap, candidate_name, identity))
+
+        if not fuzzy_rows:
+            return None, None
+
+        fuzzy_rows.sort(key=lambda item: item[0], reverse=True)
+        best_score, best_seq, best_overlap, best_name, best_identity = fuzzy_rows[0]
+        second_score = fuzzy_rows[1][0] if len(fuzzy_rows) > 1 else 0.0
+
+        token_count = max(len(canonical_seed.split()), 1)
+        threshold = 0.94 if token_count == 1 else 0.88
+        if best_score >= threshold and (best_score - second_score) >= 0.03:
+            bt.logging.info(
+                f"Identity fallback matched '{seed_name}' -> '{best_name}' "
+                f"(score={best_score:.3f}, seq={best_seq:.3f}, overlap={best_overlap:.3f})"
+            )
+            return best_name, best_identity
+
+        return None, None
+
     def _clean_name_candidate(self, raw_name: str, seed_name: str, is_multipart: bool) -> Optional[str]:
         """Normalize and validate name candidates before scoring."""
         if not raw_name:
             return None
-        candidate = re.sub(r"[^A-Za-zÀ-ÿ\s]", " ", str(raw_name))
-        candidate = " ".join(candidate.split()).strip()
+        candidate = self._normalize_name_text(str(raw_name))
         if not candidate:
             return None
-        if candidate.lower() == seed_name.lower():
-            return None
-        parts = candidate.split()
-        if is_multipart and len(parts) < 2:
-            return None
-        if not is_multipart and len(parts) != 1:
+        if not self._is_name_like_candidate(candidate, seed_name, is_multipart):
             return None
         return candidate
 
@@ -318,7 +550,7 @@ class Miner(BaseMinerNeuron):
 
     def _mutate_name_part(self, part: str) -> List[str]:
         """Generate lightweight name mutations for fallback diversity."""
-        part_clean = re.sub(r"[^A-Za-zÀ-ÿ]", "", part)
+        part_clean = "".join(ch for ch in str(part) if ch.isalpha())
         if len(part_clean) < 3:
             return []
         lower = part_clean.lower()
@@ -355,6 +587,111 @@ class Miner(BaseMinerNeuron):
             seen.add(normalized)
             unique.append(self._apply_word_case(part_clean, normalized))
         return unique
+
+    def _apply_rule_to_seed_name(self, seed_name: str, rule: str, attempt: int) -> Optional[str]:
+        """
+        Build one deterministic candidate intended to satisfy a requested transformation rule.
+        Uses letter-only transforms to avoid non-letter penalties.
+        """
+        parts = [p for p in str(seed_name).split() if p.strip()]
+        if not parts:
+            return None
+
+        mutable_parts = ["".join(ch for ch in p if ch.isalpha()) for p in parts]
+        mutable_parts = [p if p else raw for p, raw in zip(mutable_parts, parts)]
+        target_idx = attempt % len(mutable_parts)
+        base_part = mutable_parts[target_idx]
+        if len(base_part) < 2:
+            return None
+
+        if rule == "insert_random_letter":
+            letter_pool = "aeiourstlnm"
+            insert_at = max(1, min(len(base_part) - 1, len(base_part) // 2))
+            inserted = letter_pool[(attempt + len(base_part)) % len(letter_pool)]
+            mutated = base_part[:insert_at] + inserted + base_part[insert_at:]
+            result = mutable_parts.copy()
+            result[target_idx] = self._apply_word_case(base_part, mutated)
+            return " ".join(result)
+
+        if rule in ("swap_adjacent_syllables", "swap_random_letter"):
+            if len(base_part) < 3:
+                return None
+            swap_at = max(0, min(len(base_part) - 2, len(base_part) // 2 - 1 + (attempt % 2)))
+            chars = list(base_part)
+            if chars[swap_at].lower() == chars[swap_at + 1].lower():
+                swap_at = max(0, min(len(base_part) - 2, swap_at + 1))
+            chars[swap_at], chars[swap_at + 1] = chars[swap_at + 1], chars[swap_at]
+            result = mutable_parts.copy()
+            result[target_idx] = "".join(chars)
+            return " ".join(result)
+
+        if rule in ("delete_random_letter", "remove_random_vowel", "remove_random_consonant"):
+            if len(base_part) < 4:
+                return None
+            idx_pool = list(range(len(base_part)))
+            if rule == "remove_random_vowel":
+                idx_pool = [i for i, ch in enumerate(base_part) if ch.lower() in "aeiou"]
+            elif rule == "remove_random_consonant":
+                idx_pool = [i for i, ch in enumerate(base_part) if ch.isalpha() and ch.lower() not in "aeiou"]
+            if not idx_pool:
+                return None
+            rm_at = idx_pool[attempt % len(idx_pool)]
+            mutated = base_part[:rm_at] + base_part[rm_at + 1:]
+            if len(mutated) < 2:
+                return None
+            result = mutable_parts.copy()
+            result[target_idx] = mutated
+            return " ".join(result)
+
+        if rule == "duplicate_random_letter_as_double_letter":
+            dup_at = max(0, min(len(base_part) - 1, len(base_part) // 2))
+            mutated = base_part[:dup_at] + base_part[dup_at] + base_part[dup_at:]
+            result = mutable_parts.copy()
+            result[target_idx] = mutated
+            return " ".join(result)
+
+        if rule == "shorten_name_to_abbreviations":
+            if len(mutable_parts) == 1:
+                short_len = max(2, min(len(base_part) - 1, len(base_part) // 2 + 1))
+                return mutable_parts[0][:short_len]
+            abbreviated = []
+            for word in mutable_parts:
+                if len(word) <= 2:
+                    abbreviated.append(word)
+                else:
+                    short_len = max(1, min(len(word) - 1, int(round(len(word) * 0.6))))
+                    abbreviated.append(word[:short_len])
+            return " ".join(abbreviated)
+
+        if rule == "name_parts_permutations" and len(mutable_parts) >= 2:
+            shift = (attempt % (len(mutable_parts) - 1)) + 1
+            return " ".join(mutable_parts[shift:] + mutable_parts[:shift])
+
+        return None
+
+    def _build_rule_aware_candidates(self, seed_name: str, rules: List[str], target_count: int) -> List[str]:
+        """Generate a bounded set of rule-targeted name candidates."""
+        if target_count <= 0 or not rules:
+            return []
+
+        is_multipart = len(seed_name.split()) > 1
+        candidates: List[str] = []
+        seen = {seed_name.lower()}
+        max_attempts = max(24, target_count * max(3, len(rules)) * 6)
+        attempt = 0
+        while len(candidates) < target_count and attempt < max_attempts:
+            rule = rules[attempt % len(rules)]
+            raw_candidate = self._apply_rule_to_seed_name(seed_name, rule, attempt)
+            cleaned = self._clean_name_candidate(raw_candidate or "", seed_name, is_multipart)
+            attempt += 1
+            if not cleaned:
+                continue
+            key = cleaned.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(cleaned)
+        return candidates
 
     def _build_name_fallback_candidates(self, seed_name: str, is_multipart: bool) -> List[str]:
         """Generate structured fallback names when LLM output is too short."""
@@ -398,6 +735,7 @@ class Miner(BaseMinerNeuron):
         seed_name: str,
         extracted_names: List[str],
         target_count: int,
+        query_template: str = "",
     ) -> List[str]:
         """Ensure we return a stable count of unique name variations."""
         is_multipart = len(seed_name.split()) > 1
@@ -414,6 +752,29 @@ class Miner(BaseMinerNeuron):
             cleaned.append(candidate)
             if len(cleaned) >= target_count:
                 return cleaned[:target_count]
+
+        # Proactively inject a bounded set of rule-targeted candidates when requested.
+        rule_percentage = self._extract_rule_percentage(query_template, default=0.0)
+        requested_rules = self._extract_requested_transformations(query_template)
+        if requested_rules and rule_percentage > 0:
+            rule_target_count = int(round(target_count * rule_percentage))
+            if target_count > 1:
+                rule_target_count = min(target_count - 1, max(1, rule_target_count))
+            else:
+                rule_target_count = 1
+            rule_candidates = self._build_rule_aware_candidates(seed_name, requested_rules, rule_target_count)
+            prioritized = []
+            prioritized_seen = set()
+            for candidate in rule_candidates + cleaned:
+                key = candidate.lower()
+                if key in prioritized_seen:
+                    continue
+                prioritized_seen.add(key)
+                prioritized.append(candidate)
+                if len(prioritized) >= target_count:
+                    break
+            cleaned = prioritized
+            seen = prioritized_seen
 
         fallback_candidates = self._build_name_fallback_candidates(seed_name, is_multipart)
         for fallback in fallback_candidates:
@@ -436,7 +797,12 @@ class Miner(BaseMinerNeuron):
             part = seed_parts[part_idx]
             if len(part) < 2:
                 continue
-            perturb = part[:-1] + random.choice("aeiouwy")
+            if all(ord(ch) < 128 for ch in part):
+                pool = "aeiouwy"
+                replacement = pool[(counter + part_idx) % len(pool)]
+            else:
+                replacement = part[0]
+            perturb = part[:-1] + replacement
             perturb = self._apply_word_case(part, perturb)
             generated = seed_parts.copy()
             generated[part_idx] = perturb
@@ -564,12 +930,12 @@ class Miner(BaseMinerNeuron):
 
     def _pick_city_for_country(self, country_code: Optional[str], preferred_city: Optional[str], idx: int) -> str:
         """Pick a deterministic city for the resolved country."""
-        if preferred_city:
+        if preferred_city and idx == 0:
             return preferred_city
         if country_code and country_code in self._city_names_by_country:
             candidates = self._city_names_by_country[country_code]
             if candidates:
-                return candidates[idx % len(candidates)]
+                return candidates[(idx + (1 if preferred_city else 0)) % len(candidates)]
         return "New York"
 
     def _make_address_line(self, city: str, country: str, idx: int) -> str:
@@ -610,6 +976,167 @@ class Miner(BaseMinerNeuron):
         elif len(addresses) < target_count:
             addresses.extend([addresses[-1]] * (target_count - len(addresses)))
         return addresses[:target_count]
+
+    @staticmethod
+    def _increment_fail_reason(fail_reasons: Dict[str, int], reason: str, amount: int = 1) -> None:
+        if not reason:
+            return
+        if amount <= 0:
+            return
+        fail_reasons[reason] = int(fail_reasons.get(reason, 0)) + int(amount)
+
+    @staticmethod
+    def _merge_fail_reasons(target: Dict[str, int], source: Dict[str, int]) -> None:
+        for reason, count in (source or {}).items():
+            Miner._increment_fail_reason(target, str(reason), int(count))
+
+    def _emit_run_metrics(
+        self,
+        run_id: int,
+        requested_names: int,
+        returned_names: int,
+        s3_submissions: int,
+        fail_reasons: Dict[str, int],
+    ) -> None:
+        payload = {
+            "run_id": int(run_id),
+            "requested_names": int(max(requested_names, 0)),
+            "returned_names": int(max(returned_names, 0)),
+            "s3_submissions": int(max(s3_submissions, 0)),
+            "fail_reasons": {k: int(v) for k, v in sorted((fail_reasons or {}).items()) if int(v) > 0},
+        }
+        bt.logging.info(f"RUN_METRICS {json.dumps(payload, ensure_ascii=False, sort_keys=True)}")
+
+    def _emit_telegram_event(self, event: str, payload: Dict[str, Any]) -> None:
+        """Emit structured log events consumed by monitoring/telegram_notifier.py."""
+        envelope = {
+            "event": str(event),
+            "timestamp_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "payload": payload or {},
+        }
+        try:
+            bt.logging.info(
+                f"TELEGRAM_EVENT {json.dumps(envelope, ensure_ascii=False, default=str, sort_keys=True)}"
+            )
+        except Exception as e:
+            bt.logging.debug(f"Failed to emit TELEGRAM_EVENT {event}: {e}")
+
+    def _safe_int(self, value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
+
+    def _summarize_identity_payload(self, identity_rows: List[List[str]]) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for index, identity in enumerate(identity_rows or [], start=1):
+            raw = [str(part) for part in list(identity or [])]
+            rows.append(
+                {
+                    "index": index,
+                    "name": raw[0] if len(raw) > 0 else "",
+                    "dob": raw[1] if len(raw) > 1 else "",
+                    "address": raw[2] if len(raw) > 2 else "",
+                    "raw": raw,
+                }
+            )
+        return rows
+
+    def _summarize_image_request(self, image_request: Any) -> Optional[Dict[str, Any]]:
+        if not image_request:
+            return None
+
+        variation_requests_raw = list(getattr(image_request, "variation_requests", []) or [])
+        variation_requests: List[Dict[str, Any]] = []
+        for index, request in enumerate(variation_requests_raw, start=1):
+            variation_requests.append(
+                {
+                    "index": index,
+                    "type": str(getattr(request, "type", "") or ""),
+                    "intensity": str(getattr(request, "intensity", "") or ""),
+                    "description": str(getattr(request, "description", "") or ""),
+                    "detail": str(getattr(request, "detail", "") or ""),
+                }
+            )
+
+        base_image = str(getattr(image_request, "base_image", "") or "")
+        base_image_hash = hashlib.sha256(base_image.encode("utf-8")).hexdigest() if base_image else ""
+
+        return {
+            "image_filename": str(getattr(image_request, "image_filename", "") or ""),
+            "challenge_id": str(getattr(image_request, "challenge_id", "") or ""),
+            "target_drand_round": self._safe_int(getattr(image_request, "target_drand_round", 0), default=0),
+            "reveal_timestamp": self._safe_int(getattr(image_request, "reveal_timestamp", 0), default=0),
+            "base_image_base64_chars": len(base_image),
+            "base_image_sha256": base_image_hash,
+            "variation_requests": variation_requests,
+            "requested_variations": len(variation_requests),
+        }
+
+    def _emit_validator_request_event(
+        self,
+        run_id: int,
+        synapse: IdentitySynapse,
+        requested_names: int,
+        timeout_seconds: float,
+    ) -> None:
+        dendrite = getattr(synapse, "dendrite", None)
+        validator_hotkey = str(getattr(dendrite, "hotkey", "") or "")
+        validator_name = self.WHITELISTED_VALIDATORS.get(validator_hotkey, "UnknownValidator")
+
+        payload = {
+            "run_id": int(run_id),
+            "requested_names": int(max(requested_names, 0)),
+            "timeout_seconds": float(timeout_seconds),
+            "validator_name": validator_name,
+            "validator_hotkey": validator_hotkey,
+            "nonce": str(getattr(dendrite, "nonce", "") or ""),
+            "uuid": str(getattr(dendrite, "uuid", "") or ""),
+            "body_hash": str(getattr(synapse, "computed_body_hash", "") or ""),
+            "query_template": str(getattr(synapse, "query_template", "") or ""),
+            "identity": self._summarize_identity_payload(list(getattr(synapse, "identity", []) or [])),
+            "image_request": self._summarize_image_request(getattr(synapse, "image_request", None)),
+        }
+        self._emit_telegram_event("validator_request", payload)
+
+    def _emit_submission_status_event(
+        self,
+        run_id: int,
+        requested_names: int,
+        returned_names: int,
+        s3_submissions: int,
+        fail_reasons: Dict[str, int],
+        note: str = "",
+    ) -> None:
+        payload = {
+            "run_id": int(run_id),
+            "submitted_to_validator": True,
+            "requested_names": int(max(requested_names, 0)),
+            "returned_names": int(max(returned_names, 0)),
+            "s3_submissions": int(max(s3_submissions, 0)),
+            "fail_reasons": {k: int(v) for k, v in sorted((fail_reasons or {}).items()) if int(v) > 0},
+            "note": str(note or ""),
+        }
+        self._emit_telegram_event("validator_submission_status", payload)
+
+    def _should_prewarm_flux(self) -> bool:
+        value = os.environ.get("SN54_FLUX_PREWARM", "true").strip().lower()
+        return value in {"1", "true", "yes", "on"}
+
+    def _run_flux_prewarm(self) -> None:
+        try:
+            bt.logging.info("FLUX prewarm: starting background warm-up")
+            prewarm_flux_pipeline()
+            bt.logging.info("FLUX prewarm: completed")
+        except Exception as e:
+            bt.logging.warning(f"FLUX prewarm skipped: {e}")
+
+    def _schedule_flux_prewarm(self) -> None:
+        if not self._should_prewarm_flux():
+            bt.logging.info("FLUX prewarm disabled via SN54_FLUX_PREWARM")
+            return
+        thread = threading.Thread(target=self._run_flux_prewarm, name="sn54-flux-prewarm", daemon=True)
+        thread.start()
 
     def _sync_dynamic_validator_whitelist(self):
         """Sync allowlist with current validator-permit hotkeys on chain."""
@@ -695,6 +1222,34 @@ class Miner(BaseMinerNeuron):
         self._sync_dynamic_validator_whitelist()
         self.axon.verify_fns[IdentitySynapse.__name__] = self._verify_validator_request
 
+        # Optional startup optimization to reduce first Phase-4 latency.
+        self._schedule_flux_prewarm()
+
+        if not is_timelock_available():
+            bt.logging.warning(
+                "Phase 4 timelock unavailable. Encrypted submissions are disabled "
+                "until timelock_wasm_wrapper is installed."
+            )
+
+    def _unload_ollama_model(self) -> None:
+        """Release Ollama model from GPU memory before Phase 4 image generation."""
+        try:
+            result = subprocess.run(
+                ["ollama", "stop", self.model_name],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            if result.returncode == 0:
+                bt.logging.info(f"Released Ollama model {self.model_name} before Phase 4")
+            elif result.stderr:
+                bt.logging.debug(
+                    f"Ollama stop returned {result.returncode}: {result.stderr.strip()[:200]}"
+                )
+        except Exception as e:
+            bt.logging.debug(f"Ollama model unload skipped: {e}")
+
     async def _verify_validator_request(self, synapse: IdentitySynapse) -> None:
         """
         Rejects any RPC that is not cryptographically proven to come from
@@ -742,135 +1297,175 @@ class Miner(BaseMinerNeuron):
     async def forward(self, synapse: IdentitySynapse) -> IdentitySynapse:
         """
         Process a name variation request by generating variations for each name.
-        
+
         This is the main entry point for the miner's functionality. It:
         1. Receives a request with names and a query template
         2. Processes each name through the LLM
         3. Extracts variations from the LLM responses
         4. Returns the variations to the validator
-        
+
         Each run is assigned a unique timestamp ID and results are saved in a
         dedicated directory for that run.
-        
+
         Args:
             synapse: The IdentitySynapse containing names and query template
-            
+
         Returns:
             The synapse with variations field populated with name variations
         """
-        # Generate a unique run ID using timestamp
         run_id = int(time.time())
-        bt.logging.info(f"Starting run {run_id} for {len(synapse.identity)} names")
-        
-        # Get timeout from synapse (default to 120s if not specified)
+        requested_names = len(synapse.identity)
+        bt.logging.info(f"Starting run {run_id} for {requested_names} names")
+
         timeout = getattr(synapse, 'timeout', 120.0)
-        bt.logging.info(f"Request timeout: {timeout:.1f}s for {len(synapse.identity)} names")
+        bt.logging.info(f"Request timeout: {timeout:.1f}s for {requested_names} names")
         start_time = time.time()
-        
-        # Create a run-specific directory
+
+        run_fail_reasons: Dict[str, int] = {}
+        self._emit_validator_request_event(
+            run_id=run_id,
+            synapse=synapse,
+            requested_names=requested_names,
+            timeout_seconds=timeout,
+        )
+
         run_dir = os.path.join(self.output_path, f"run_{run_id}")
         os.makedirs(run_dir, exist_ok=True)
-        
-        # This will store all responses from the LLM in a format that can be processed later
-        # Format: ["Respond", "---", "Query-{name}", "---", "{LLM response}"]
-        Response_list = []
-        
-        # Track which names we've processed
-        processed_names = []
-        
-        # Process each identity in the request, respecting the timeout
-        for i, identity in enumerate(tqdm(synapse.identity, desc="Processing identities")):
-            # Check if we're approaching the timeout (reserve 15% for processing)
+
+        response_list: List[str] = []
+        processed_names: List[str] = []
+        timeout_skips = 0
+
+        for identity in tqdm(synapse.identity, desc="Processing identities"):
             elapsed = time.time() - start_time
             remaining = timeout - elapsed
-            time_buffer = timeout * 0.15  # Reserve 15% of total time for final processing
-            
-            # If time is running out, skip remaining identities
+            time_buffer = timeout * 0.15
+
             if remaining < time_buffer:
+                timeout_skips = max(0, requested_names - len(processed_names))
                 bt.logging.warning(
                     f"Time limit approaching ({elapsed:.1f}/{timeout:.1f}s), "
-                    f"processed {len(processed_names)}/{len(synapse.identity)} identities. "
+                    f"processed {len(processed_names)}/{requested_names} identities. "
                     f"Skipping remaining identities to ensure timely response."
                 )
                 break
-            
-            # Extract name, dob, and address from identity array
+
             name = identity[0] if len(identity) > 0 else "Unknown"
             dob = identity[1] if len(identity) > 1 else "Unknown"
             address = identity[2] if len(identity) > 2 else "Unknown"
-            
-            # Format the response list for later processing
-            Response_list.append("Respond")
-            Response_list.append("---")
-            Response_list.append("Query-" + name)
-            Response_list.append("---")
-            
-            # Format the query with the current name, address, and DOB
+
+            response_list.append("Respond")
+            response_list.append("---")
+            response_list.append("Query-" + name)
+            response_list.append("---")
+
             formatted_query = synapse.query_template.replace("{name}", name)
             formatted_query = formatted_query.replace("{address}", address)
             formatted_query = formatted_query.replace("{dob}", dob)
-            
-            # Query the LLM with timeout awareness
+
             try:
                 bt.logging.info(f"Generating variations for name: {name}, remaining time: {remaining:.1f}s")
-                # Pass a more limited timeout to the LLM call to ensure we stay within bounds
                 name_respond = self.Get_Respond_LLM(formatted_query)
-                Response_list.append(name_respond)
+                response_list.append(name_respond)
                 processed_names.append(name)
             except Exception as e:
                 bt.logging.error(f"Error querying LLM for name {name}: {str(e)}")
-                Response_list.append("Error: " + str(e))
-        
-        # Check if we've managed to process at least some names
+                response_list.append("Error: " + str(e))
+                self._increment_fail_reason(run_fail_reasons, "llm_query_error")
+
+        if timeout_skips > 0:
+            self._increment_fail_reason(run_fail_reasons, "name_generation_timeout_skips", timeout_skips)
+
         if not processed_names:
             bt.logging.error("Could not process any names within the timeout period")
             synapse.variations = {}
+            synapse.s3_submissions = []
+            self._increment_fail_reason(run_fail_reasons, "no_names_processed")
+            self._emit_run_metrics(
+                run_id=run_id,
+                requested_names=requested_names,
+                returned_names=0,
+                s3_submissions=0,
+                fail_reasons=run_fail_reasons,
+            )
+            self._emit_submission_status_event(
+                run_id=run_id,
+                requested_names=requested_names,
+                returned_names=0,
+                s3_submissions=0,
+                fail_reasons=run_fail_reasons,
+                note="no_names_processed",
+            )
             return synapse
-        
-        # Process the responses to extract variations, but be aware of remaining time
+
         remaining = timeout - (time.time() - start_time)
         bt.logging.info(f"Processing responses with {remaining:.1f}s remaining of {timeout:.1f}s timeout")
-        
-        # Only proceed with processing if we have enough time
-        if remaining > 1.0:  # Ensure at least 1 second for processing
+
+        if remaining > 1.0:
             variations = self.process_variations(
-                Response_list,
+                response_list,
                 run_id,
                 run_dir,
                 synapse.identity,
                 synapse.query_template,
+                run_fail_reasons=run_fail_reasons,
             )
             bt.logging.info(f"======== FINAL VARIATIONS===============================================: {variations}")
-            # Set the variations in the synapse for return to the validator
             synapse.variations = variations
         else:
-            bt.logging.warning(f"Insufficient time for processing responses, returning empty result")
+            bt.logging.warning("Insufficient time for processing responses, returning empty result")
             synapse.variations = {}
-        
-        # Log final timing information
+            self._increment_fail_reason(run_fail_reasons, "insufficient_postprocess_time")
+
+        returned_names = len(synapse.variations or {})
+        if returned_names < requested_names:
+            self._increment_fail_reason(
+                run_fail_reasons,
+                "identity_return_shortfall",
+                requested_names - returned_names,
+            )
+
         total_time = time.time() - start_time
         bt.logging.info(
             f"Request completed in {total_time:.2f}s of {timeout:.1f}s allowed. "
-            f"Processed {len(processed_names)}/{len(synapse.identity)} names."
+            f"Processed {len(processed_names)}/{requested_names} names."
         )
-        
+
         bt.logging.info(f"======== SYNAPSE VARIATIONS===============================================: {synapse.variations}")
-        bt.logging.info(f"==========================Processed variations for {len(synapse.variations)} names in run {run_id}")
-        bt.logging.info(f"==========================Synapse: {synapse}")
+        bt.logging.info(f"==========================Processed variations for {returned_names} names in run {run_id}")
         bt.logging.info("========================================================================================")
 
-        # ==========================================================================
-        # Phase 4: Process Image Request
-        # ==========================================================================
+        s3_submissions_count = 0
+        synapse.s3_submissions = []
+
         if hasattr(synapse, 'image_request') and synapse.image_request is not None:
             try:
-                s3_submissions = self.process_image_request(synapse)
+                self._unload_ollama_model()
+                s3_submissions, phase4_fail_reasons = self.process_image_request(synapse)
                 synapse.s3_submissions = s3_submissions
-                bt.logging.info(f"Phase 4: Generated {len(s3_submissions)} S3 submissions")
+                s3_submissions_count = len(s3_submissions)
+                self._merge_fail_reasons(run_fail_reasons, phase4_fail_reasons)
+                bt.logging.info(f"Phase 4: Generated {s3_submissions_count} S3 submissions")
             except Exception as e:
                 bt.logging.error(f"Phase 4: Failed to process image request: {e}")
+                self._increment_fail_reason(run_fail_reasons, "phase4_unhandled_exception")
                 synapse.s3_submissions = []
-        # ==========================================================================
+
+        self._emit_run_metrics(
+            run_id=run_id,
+            requested_names=requested_names,
+            returned_names=returned_names,
+            s3_submissions=s3_submissions_count,
+            fail_reasons=run_fail_reasons,
+        )
+        self._emit_submission_status_event(
+            run_id=run_id,
+            requested_names=requested_names,
+            returned_names=returned_names,
+            s3_submissions=s3_submissions_count,
+            fail_reasons=run_fail_reasons,
+            note="forward_return",
+        )
 
         return synapse
 
@@ -894,7 +1489,7 @@ class Miner(BaseMinerNeuron):
         except Exception:
             return False
 
-    def process_image_request(self, synapse: IdentitySynapse) -> List[S3Submission]:
+    def process_image_request(self, synapse: IdentitySynapse) -> Tuple[List[S3Submission], Dict[str, int]]:
         """Process Phase 4 image variation request.
 
         Generates image variations, encrypts them with drand timelock,
@@ -904,113 +1499,177 @@ class Miner(BaseMinerNeuron):
             synapse: IdentitySynapse with image_request
 
         Returns:
-            List of S3Submission objects
+            (s3_submissions, fail_reasons)
         """
         image_request = synapse.image_request
+        fail_reasons: Dict[str, int] = {}
         if not image_request:
-            return []
+            return [], fail_reasons
+
+        def req_type(req: Any) -> str:
+            return str(getattr(req, "type", None) or (req.get("type") if isinstance(req, dict) else "") or "unknown").strip()
+
+        def req_intensity(req: Any) -> str:
+            return str(getattr(req, "intensity", None) or (req.get("intensity") if isinstance(req, dict) else "") or "standard").strip()
+
+        def req_label(req: Any) -> str:
+            return f"{req_type(req)}({req_intensity(req)})"
 
         try:
-            # 1. Decode base image
             bt.logging.info(f"Phase 4: Decoding base image: {image_request.image_filename}")
             base_image = decode_base_image(image_request.base_image)
 
-            # Extract seed image name from filename (remove .png extension if present)
             seed_image_name = image_request.image_filename
             if seed_image_name.endswith('.png'):
-                seed_image_name = seed_image_name[:-4]  # Remove .png extension
+                seed_image_name = seed_image_name[:-4]
             elif seed_image_name.endswith('.jpg') or seed_image_name.endswith('.jpeg'):
-                seed_image_name = seed_image_name.rsplit('.', 1)[0]  # Remove extension
+                seed_image_name = seed_image_name.rsplit('.', 1)[0]
 
-            # 2. Generate variations via FLUX: pass full variation_requests (type + intensity per variation)
-            #    so the model gets the correct prompt for each (pose_edit/light, expression_edit/medium, etc.)
+            variation_requests = list(image_request.variation_requests or [])
+            if not variation_requests:
+                self._increment_fail_reason(fail_reasons, "phase4_no_variation_requests")
+                return [], fail_reasons
+
+            labels = [req_label(req) for req in variation_requests]
             bt.logging.info(
-                f"Phase 4: Generating {image_request.requested_variations} variations "
-                f"(from validator: {[f'{v.type}({v.intensity})' for v in image_request.variation_requests]})"
-            )
-            variations = generate_variations(
-                base_image,
-                image_request.variation_requests
+                f"Phase 4: Generating {len(variation_requests)} variations "
+                f"(from validator: {labels})"
             )
 
-            # 3. Process each variation
-            s3_submissions = []
-            target_round = image_request.target_drand_round
+            configured_attempts = os.environ.get("PHASE4_RETRY_ATTEMPTS")
+            if configured_attempts is None and hasattr(self.config, "neuron"):
+                configured_attempts = getattr(self.config.neuron, "phase4_retry_attempts", 2)
+            max_attempts = max(1, int(configured_attempts or 2))
+
+            target_round = int(image_request.target_drand_round)
+            if target_round <= 0:
+                self._increment_fail_reason(fail_reasons, "phase4_invalid_target_round", len(variation_requests))
+                bt.logging.error(f"Phase 4: Invalid drand target round: {target_round}")
+                return [], fail_reasons
+
             challenge_id = image_request.challenge_id or "sandbox_test"
-
-            # Generate path_signature ONCE per challenge for security
-            # This prevents other miners from writing to our path
             path_message = f"{challenge_id}:{self.wallet.hotkey.ss58_address}"
             path_signature = self.wallet.hotkey.sign(path_message.encode()).hex()[:16]
             bt.logging.debug(f"Phase 4: Generated path_signature: {path_signature}")
 
-            for var in variations:
-                try:
-                    # Validate image before processing
-                    if not self.is_valid_image_bytes(var["image_bytes"]):
-                        bt.logging.warning(
-                            f"Phase 4: Skipping invalid/corrupt image for {var['variation_type']}"
-                        )
-                        continue
+            if not is_timelock_available():
+                bt.logging.error("Phase 4: Timelock unavailable; refusing unencrypted submissions")
+                self._increment_fail_reason(fail_reasons, "phase4_timelock_unavailable", len(variation_requests))
+                return [], fail_reasons
 
-                    # Validate face identity preserved (AdaFace, threshold 0.7)
-                    if not validate_variation(var, base_image, min_similarity=0.7):
-                        bt.logging.warning(
-                            f"Phase 4: Skipping {var['variation_type']} - face identity not preserved"
-                        )
-                        continue
-                    
-                    # Sign the image hash
-                    message = f"challenge:{challenge_id}:hash:{var['image_hash']}"
-                    signature = self.wallet.hotkey.sign(message.encode()).hex()
+            s3_submissions: List[S3Submission] = []
 
-                    # Encrypt with drand timelock
-                    if is_timelock_available():
-                        encrypted_data = encrypt_image_for_drand(
-                            var["image_bytes"],
-                            target_round
-                        )
-                        if encrypted_data is None:
-                            bt.logging.warning(f"Phase 4: Encryption failed for {var['variation_type']}")
+            for req_index, request in enumerate(variation_requests, start=1):
+                base_variation_type = req_type(request)
+                label = req_label(request)
+                success = False
+                last_reason = "phase4_unknown_failure"
+
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        generated = generate_variations(base_image, [request])
+                        if not generated:
+                            last_reason = "phase4_generation_empty"
+                            bt.logging.warning(
+                                f"Phase 4: {label} attempt {attempt}/{max_attempts} returned no image"
+                            )
                             continue
-                    else:
-                        # SANDBOX: Use raw bytes if timelock not available
-                        bt.logging.warning("Phase 4: Timelock not available, using raw bytes (SANDBOX ONLY)")
-                        encrypted_data = var["image_bytes"]
 
-                    # Upload to S3 (SANDBOX: mock upload)
-                    s3_key = upload_to_s3(
-                        encrypted_data=encrypted_data,
-                        miner_hotkey=self.wallet.hotkey.ss58_address,
-                        signature=signature,
-                        image_hash=var["image_hash"],
-                        target_round=target_round,
-                        challenge_id=challenge_id,
-                        variation_type=var["variation_type"],
-                        path_signature=path_signature,
-                        seed_image_name=seed_image_name
+                        var = generated[0]
+                        image_bytes = var.get("image_bytes", b"")
+                        if not image_bytes or not self.is_valid_image_bytes(image_bytes):
+                            last_reason = "phase4_invalid_image"
+                            bt.logging.warning(
+                                f"Phase 4: {label} attempt {attempt}/{max_attempts} produced invalid image"
+                            )
+                            continue
+
+                        if not validate_variation(var, base_image, min_similarity=0.7):
+                            last_reason = "phase4_identity_not_preserved"
+                            bt.logging.warning(
+                                f"Phase 4: {label} attempt {attempt}/{max_attempts} failed face-identity check"
+                            )
+                            continue
+
+                        image_hash = str(var.get("image_hash", "")).strip()
+                        if not image_hash:
+                            last_reason = "phase4_missing_image_hash"
+                            bt.logging.warning(
+                                f"Phase 4: {label} attempt {attempt}/{max_attempts} missing image hash"
+                            )
+                            continue
+
+                        message = f"challenge:{challenge_id}:hash:{image_hash}"
+                        signature = self.wallet.hotkey.sign(message.encode()).hex()
+
+                        encrypted_data = encrypt_image_for_drand(image_bytes, target_round)
+                        if encrypted_data is None:
+                            last_reason = "phase4_timelock_encrypt_failed"
+                            bt.logging.warning(
+                                f"Phase 4: {label} attempt {attempt}/{max_attempts} encryption failed"
+                            )
+                            continue
+
+                        s3_key = upload_to_s3(
+                            encrypted_data=encrypted_data,
+                            miner_hotkey=self.wallet.hotkey.ss58_address,
+                            signature=signature,
+                            image_hash=image_hash,
+                            target_round=target_round,
+                            challenge_id=challenge_id,
+                            variation_type=base_variation_type,
+                            path_signature=path_signature,
+                            seed_image_name=seed_image_name,
+                        )
+
+                        if not s3_key:
+                            last_reason = "phase4_s3_upload_failed"
+                            bt.logging.warning(
+                                f"Phase 4: {label} attempt {attempt}/{max_attempts} upload failed"
+                            )
+                            continue
+
+                        s3_submissions.append(
+                            S3Submission(
+                                s3_key=s3_key,
+                                image_hash=image_hash,
+                                signature=signature,
+                                variation_type=base_variation_type,
+                                path_signature=path_signature,
+                            )
+                        )
+                        bt.logging.debug(f"Phase 4: Created submission for {label} (request #{req_index})")
+                        success = True
+                        if attempt > 1:
+                            bt.logging.info(
+                                f"Phase 4: {label} succeeded after retry {attempt}/{max_attempts}"
+                            )
+                        break
+
+                    except Exception as e:
+                        last_reason = "phase4_variation_exception"
+                        bt.logging.warning(
+                            f"Phase 4: {label} attempt {attempt}/{max_attempts} error: {e}"
+                        )
+
+                if not success:
+                    self._increment_fail_reason(fail_reasons, last_reason)
+                    bt.logging.error(
+                        f"Phase 4: {label} failed after {max_attempts} attempts ({last_reason})"
                     )
 
-                    if s3_key:
-                        s3_submissions.append(S3Submission(
-                            s3_key=s3_key,
-                            image_hash=var["image_hash"],
-                            signature=signature,
-                            variation_type=var["variation_type"],
-                            path_signature=path_signature
-                        ))
-                        bt.logging.debug(f"Phase 4: Created submission for {var['variation_type']}")
-
-                except Exception as e:
-                    bt.logging.error(f"Phase 4: Error processing variation {var['variation_type']}: {e}")
-                    continue
-
-            bt.logging.info(f"Phase 4: Successfully created {len(s3_submissions)} S3 submissions")
-            return s3_submissions
+            bt.logging.info(
+                f"Phase 4: Successfully created {len(s3_submissions)} S3 submissions "
+                f"out of {len(variation_requests)} requests"
+            )
+            if fail_reasons:
+                bt.logging.warning(f"Phase 4 fail reasons: {dict(sorted(fail_reasons.items()))}")
+            return s3_submissions, fail_reasons
 
         except Exception as e:
+            self._increment_fail_reason(fail_reasons, "phase4_request_error")
             bt.logging.error(f"Phase 4: Error in process_image_request: {e}")
-            return []
+            return [], fail_reasons
 
     def Get_Respond_LLM(self, prompt: str) -> str:
         """
@@ -1038,14 +1697,16 @@ TASK:
 {prompt}
 
 OUTPUT RULES (STRICT):
-- Return only name variations.
-- Return exactly {target_count} name variations.
-- Output plain comma-separated values.
-- No numbering, no bullets, no JSON, no explanation text.
-- Keep each variation as a realistic person name.
-- Preserve the original name-part structure (single-part stays single-part, multi-part stays multi-part).
-- Provide diverse, non-duplicate variants.
-- Ignore image, UAV, and metadata sections if present in the task text.
+- Return only person-name variations.
+- Return exactly {target_count} comma-separated entries.
+- No numbering, no bullets, no JSON, no extra commentary.
+- Preserve source structure: single-part stays single-part; multi-part stays multi-part.
+- Keep each variation as a plausible legal name token sequence.
+- Do not include countries, cities, addresses, metadata, IDs, or occupations.
+- Do not include the unchanged original seed name.
+- No duplicates.
+- Allowed characters: letters from any language plus spaces, apostrophes, and hyphens.
+- Ignore image/UAV/model instructions if present in the task text.
 """
 
         # Use Ollama to query the LLM
@@ -1061,8 +1722,8 @@ OUTPUT RULES (STRICT):
                 options={
                     # Add a reasonable timeout to ensure we don't get stuck
                     "num_predict": 1024,
-                    "temperature": 0.7,
-                    "top_p": 0.9
+                    "temperature": 0.35,
+                    "top_p": 0.85
                 }
             )
             
@@ -1079,14 +1740,15 @@ OUTPUT RULES (STRICT):
         run_dir: str,
         identity_list: List[List[str]],
         query_template: str,
+        run_fail_reasons: Optional[Dict[str, int]] = None,
     ) -> Dict[str, List[List[str]]]:
         """
         Process LLM responses to extract identity variations.
-        
+
         This function takes the raw LLM responses and extracts the name variations
         using the Process_function. It then creates structured variations that include
         name, DOB, and address variations for each identity.
-        
+
         Args:
             Response_list: List of LLM responses in the format:
                           ["Respond", "---", "Query-{name}", "---", "{LLM response}"]
@@ -1094,26 +1756,36 @@ OUTPUT RULES (STRICT):
             run_dir: Directory to save run-specific files
             identity_list: List of identity arrays, each containing [name, dob, address]
             query_template: Validator query used to infer expected variation count
-            
+            run_fail_reasons: Mutable fail-reason counter for structured run metrics
+
         Returns:
             Dictionary mapping each name to its list of [name, dob, address] variations
         """
+        if run_fail_reasons is None:
+            run_fail_reasons = {}
+
         bt.logging.info(f"Processing {len(Response_list)} responses")
         responds = "".join(Response_list).split("Respond")
         expected_count = self._extract_expected_variation_count(query_template, default=10)
         bt.logging.info(f"Parsed expected variation count from query: {expected_count}")
 
-        identity_by_name = {}
-        identity_by_normalized_name = {}
+        identity_by_name: Dict[str, List[str]] = {}
+        identity_by_normalized_name: Dict[str, List[str]] = {}
+        identity_candidates: List[Tuple[str, str, List[str]]] = []
+
         for identity in identity_list:
             if not identity:
                 continue
             seed_name = str(identity[0]).strip()
-            if seed_name:
-                identity_by_name[seed_name] = identity
-                norm_seed = re.sub(r"\s+", " ", re.sub(r"[^A-Za-zÀ-ÿ\s]", " ", seed_name)).strip().lower()
-                if norm_seed:
-                    identity_by_normalized_name[norm_seed] = identity
+            if not seed_name:
+                continue
+            identity_by_name[seed_name] = identity
+            norm_seed = self._normalize_name_text(seed_name)
+            if norm_seed:
+                identity_by_normalized_name[norm_seed] = identity
+            canonical_seed = self._canonical_name_key(seed_name)
+            if canonical_seed:
+                identity_candidates.append((seed_name, canonical_seed, identity))
 
         name_variations: Dict[str, List[List[str]]] = {}
 
@@ -1122,26 +1794,43 @@ OUTPUT RULES (STRICT):
                 llm_respond = self.Process_function(responds[i], False)
                 seed_name = llm_respond[0]
 
-                matching_identity = identity_by_name.get(seed_name)
-                if matching_identity is None:
-                    norm_name = re.sub(r"\s+", " ", re.sub(r"[^A-Za-zÀ-ÿ\s]", " ", seed_name)).strip().lower()
-                    matching_identity = identity_by_normalized_name.get(norm_name)
+                matched_seed_name, matching_identity = self._resolve_identity_match(
+                    seed_name,
+                    identity_by_name,
+                    identity_by_normalized_name,
+                    identity_candidates,
+                )
                 if matching_identity is None:
                     bt.logging.warning(f"Could not find identity for name {seed_name}")
+                    self._increment_fail_reason(run_fail_reasons, "identity_match_miss")
                     continue
 
+                canonical_seed_name = matched_seed_name or seed_name
                 seed_dob = str(matching_identity[1]).strip() if len(matching_identity) > 1 else ""
                 seed_address = str(matching_identity[2]).strip() if len(matching_identity) > 2 else ""
 
                 raw_name_variations = [var for var in llm_respond[2] if not pd.isna(var) and str(var).strip()]
-                names = self._ensure_target_name_count(seed_name, raw_name_variations, expected_count)
+                names = self._ensure_target_name_count(
+                    canonical_seed_name,
+                    raw_name_variations,
+                    expected_count,
+                    query_template=query_template,
+                )
                 if not names:
-                    bt.logging.warning(f"No valid name variations for {seed_name}; skipping")
-                    name_variations[seed_name] = []
+                    bt.logging.warning(f"No valid name variations for {canonical_seed_name}; skipping")
+                    self._increment_fail_reason(run_fail_reasons, "no_valid_name_variations")
+                    name_variations[canonical_seed_name] = []
                     continue
 
                 target_count = min(expected_count, len(names))
                 names = names[:target_count]
+                if target_count < expected_count:
+                    self._increment_fail_reason(
+                        run_fail_reasons,
+                        "variation_shortfall",
+                        expected_count - target_count,
+                    )
+
                 dob_variants = self._build_dob_variations(seed_dob, target_count)
                 address_variants = self._build_address_variations(seed_address, target_count)
 
@@ -1153,18 +1842,19 @@ OUTPUT RULES (STRICT):
                         address_variants[idx] if idx < len(address_variants) else (seed_address or ""),
                     ])
 
-                name_variations[seed_name] = structured
+                name_variations[canonical_seed_name] = structured
                 bt.logging.info(
-                    f"Processed {len(structured)} structured variations for {seed_name} "
+                    f"Processed {len(structured)} structured variations for {canonical_seed_name} "
                     f"(DOB non-empty: {sum(1 for s in structured if len(s) > 1 and s[1].strip())}, "
                     f"Address non-empty: {sum(1 for s in structured if len(s) > 2 and s[2].strip())})"
                 )
             except Exception as e:
                 bt.logging.error(f"Error processing response {i}: {e}")
+                self._increment_fail_reason(run_fail_reasons, "response_parse_error")
 
         bt.logging.info(f"Generated structured variations for {len(name_variations)} seed names")
         return name_variations
-    
+
     def save_variations_to_json(self, name_variations: Dict[str, List[str]], run_id: int, run_dir: str) -> None:
         """
         Save processed variations to JSON and DataFrame for debugging and analysis.
@@ -1262,40 +1952,44 @@ OUTPUT RULES (STRICT):
     def validate_variation(self, name: str, seed: str, is_multipart_name: bool) -> str:
         """
         Helper function to validate if a variation matches the seed name structure.
-        
+
         Args:
             name: The variation to validate
             seed: The original seed name
             is_multipart_name: Whether the seed is a multi-part name
-            
+
         Returns:
             str: The validated and cleaned variation, or np.nan if invalid
         """
-        name = name.strip()
+        name = (name or "").strip()
         if not name or name.isspace():
             return np.nan
-        
+
         # Handle cases with colons (e.g., "Here are variations: Name")
         if ":" in name:
             name = name.split(":")[-1].strip()
-        
-        # Check length reasonability (variation shouldn't be more than 2x the seed length)
-        if len(name) > 2 * len(seed):
+
+        name = self._normalize_name_text(name)
+        if not name:
             return np.nan
-        
-        # Check structure consistency with seed name
+
+        # Guard against malformed long strings / payload leaks.
+        if len(name) > max(2 * len(seed), 64):
+            return np.nan
+
         name_parts = name.split()
         if is_multipart_name:
-            # For multi-part seed names (e.g., "John Smith"), variations must also have multiple parts
             if len(name_parts) < 2:
                 bt.logging.warning(f"Skipping single-part variation '{name}' for multi-part seed '{seed}'")
                 return np.nan
         else:
-            # For single-part seed names (e.g., "John"), variations must be single part
             if len(name_parts) > 1:
                 bt.logging.warning(f"Skipping multi-part variation '{name}' for single-part seed '{seed}'")
                 return np.nan
-            
+
+        if not self._is_name_like_candidate(name, seed, is_multipart_name):
+            return np.nan
+
         return name
 
     def Process_function(self, string: str, debug: bool) -> Tuple[str, str, List[str], Optional[str]]:

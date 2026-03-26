@@ -5,6 +5,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/load_env.sh"
 
+dash_enabled="${DASHBOARD_ENABLED,,}"
+if [[ "${dash_enabled}" != "1" && "${dash_enabled}" != "true" && "${dash_enabled}" != "yes" ]]; then
+  echo "SN54 dashboard status"
+  echo "state: DISABLED (DASHBOARD_ENABLED=${DASHBOARD_ENABLED})"
+  exit 0
+fi
+
 echo "SN54 dashboard status"
 echo "url: http://${DASHBOARD_HOST}:${DASHBOARD_PORT}"
 echo "log: ${DASHBOARD_LOG_FILE}"

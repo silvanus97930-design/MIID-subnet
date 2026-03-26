@@ -22,25 +22,6 @@ if [[ ! -x "${MINER_ENV_PATH}/bin/python" ]]; then
   exit 1
 fi
 
-find_existing_telegram_pid() {
-  pgrep -f "telegram_notifier.py.*--state-file ${TELEGRAM_STATE_FILE}" | head -n 1 || true
-}
-
-if [[ -f "${TELEGRAM_PID_FILE}" ]]; then
-  old_pid="$(cat "${TELEGRAM_PID_FILE}" 2>/dev/null || true)"
-  if [[ -n "${old_pid}" ]] && kill -0 "${old_pid}" 2>/dev/null; then
-    echo "SN54 telegram notifier is already running with PID ${old_pid}."
-    exit 0
-  fi
-fi
-
-existing_pid="$(find_existing_telegram_pid)"
-if [[ -n "${existing_pid}" ]] && kill -0 "${existing_pid}" 2>/dev/null; then
-  echo "${existing_pid}" > "${TELEGRAM_PID_FILE}"
-  echo "SN54 telegram notifier is already running with PID ${existing_pid} (detected by state-file pattern)."
-  exit 0
-fi
-
 notifier_cmd=(
   "${MINER_ENV_PATH}/bin/python"
   "${PROJECT_ROOT}/monitoring/telegram_notifier.py"
@@ -69,10 +50,5 @@ notifier_cmd=(
   --max-chars-per-message "${TELEGRAM_MAX_CHARS_PER_MESSAGE}"
 )
 
-nohup "${notifier_cmd[@]}" >>"${TELEGRAM_LOG_FILE}" 2>&1 &
-pid=$!
-echo "${pid}" > "${TELEGRAM_PID_FILE}"
-
-echo "SN54 telegram notifier started."
-echo "PID: ${pid}"
-echo "Log: ${TELEGRAM_LOG_FILE}"
+echo "$$" > "${TELEGRAM_PID_FILE}"
+exec "${notifier_cmd[@]}"

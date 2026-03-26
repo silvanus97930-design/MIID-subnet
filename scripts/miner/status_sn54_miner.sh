@@ -5,8 +5,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/load_env.sh"
 
+find_miner_pids() {
+  pgrep -f "neurons/miner.py.*--wallet.name ${WALLET_NAME}.*--wallet.hotkey ${WALLET_HOTKEY}" || true
+}
+
 find_existing_miner_pid() {
-  pgrep -f "neurons/miner.py.*--wallet.name ${WALLET_NAME}.*--wallet.hotkey ${WALLET_HOTKEY}" | head -n 1 || true
+  find_miner_pids | head -n 1 || true
 }
 
 echo "SN54 miner status"
@@ -14,6 +18,18 @@ echo "wallet: ${WALLET_NAME:-unset}/${WALLET_HOTKEY:-unset}"
 echo "network: ${SUBTENSOR_NETWORK} netuid ${NETUID}"
 echo "model: ${MINER_MODEL_NAME}"
 echo "log: ${MINER_LOG_FILE}"
+
+runtime="host"
+if [[ -f "/.dockerenv" ]]; then
+  runtime="docker"
+fi
+echo "runtime: ${runtime}"
+if [[ "${runtime}" == "docker" ]]; then
+  container_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+  if [[ -n "${container_ip}" ]]; then
+    echo "container_ip: ${container_ip}"
+  fi
+fi
 
 status_reported=false
 stale_pid_file=false
@@ -46,11 +62,38 @@ if [[ "${status_reported}" == "false" ]]; then
   fi
 fi
 
+mapfile -t wallet_miner_pids < <(find_miner_pids)
+if [[ "${#wallet_miner_pids[@]}" -gt 1 ]]; then
+  echo "warning: duplicate miner processes detected for this wallet/hotkey: ${wallet_miner_pids[*]}"
+fi
+
 echo
 "${MINER_ENV_PATH}/bin/python" - <<PY
+import socket
 import sys
+
 sys.path.insert(0, "${PROJECT_ROOT}/monitoring")
 from port_health import PublicPortHealthMonitor, parse_csv_urls, str_to_bool
+
+
+def probe_target(ip: str | None, port: int | None, timeout_seconds: float) -> bool | None:
+    if not ip or not port:
+        return None
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout_seconds)
+        sock.connect((ip, int(port)))
+        return True
+    except Exception:
+        return False
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
 
 monitor = PublicPortHealthMonitor(
     enabled=str_to_bool("${PORT_HEALTH_ENABLED}", default=True),
@@ -65,12 +108,44 @@ monitor = PublicPortHealthMonitor(
     port_check_url="${PORT_HEALTH_CHECK_URL}",
 )
 snapshot = monitor.snapshot_dict(force=True)
+state = str(snapshot.get("state", "unknown")).upper()
+target_ip = snapshot.get("target_ip", "n/a")
+target_port = snapshot.get("target_port", "n/a")
+reason = snapshot.get("reason", "n/a")
+source = snapshot.get("source", "n/a")
+local_listener = snapshot.get("local_listener")
+
 print(
     "public_port_health: "
-    f"{snapshot.get('state', 'unknown').upper()} "
-    f"target={snapshot.get('target_ip', 'n/a')}:{snapshot.get('target_port', 'n/a')} "
-    f"detail={snapshot.get('reason', 'n/a')}"
+    f"{state} "
+    f"target={target_ip}:{target_port} "
+    f"detail={reason}"
 )
+print(
+    "public_port_meta: "
+    f"source={source} local_listener={local_listener}"
+)
+
+self_probe = probe_target(
+    target_ip if isinstance(target_ip, str) else None,
+    int(target_port) if isinstance(target_port, int) else None,
+    timeout_seconds=min(float("${PORT_HEALTH_CONNECT_TIMEOUT_SECONDS}"), 2.0),
+)
+if self_probe is not None:
+    print(f"self_probe_to_target: {'OPEN' if self_probe else 'CLOSED'}")
+
+if state == "UNREACHABLE" and local_listener is True:
+    if self_probe is True:
+        hint = (
+            "Local listener is UP and self-probe to public target works, "
+            "so closure is likely source-dependent filtering (provider firewall/ACL)."
+        )
+    else:
+        hint = (
+            "Local listener is UP but external probe is CLOSED. "
+            "Check host firewall, cloud security group, and Docker port publish."
+        )
+    print(f"reachability_hint: {hint}")
 PY
 
 if [[ -f "${MINER_LOG_FILE}" ]]; then

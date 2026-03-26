@@ -11,7 +11,10 @@ import bittensor as bt
 from typing import List, Dict
 from PIL import Image
 
-from MIID.miner.generate_variations import generate_variations as generate_variations_flux
+from MIID.miner.generate_variations import (
+    generate_variations as generate_variations_flux,
+    prewarm_pipeline as prewarm_pipeline_flux,
+)
 from MIID.miner.ada_face_compare import validate_single_variation
 
 
@@ -53,6 +56,11 @@ def calculate_image_hash(image_bytes: bytes) -> str:
         SHA256 hash as hex string
     """
     return hashlib.sha256(image_bytes).hexdigest()
+
+
+def prewarm_flux_pipeline() -> None:
+    """Load and optionally warm FLUX once after miner startup."""
+    prewarm_pipeline_flux()
 
 
 def generate_variations(

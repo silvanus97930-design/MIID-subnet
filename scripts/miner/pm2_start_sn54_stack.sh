@@ -21,9 +21,67 @@ if [[ -z "${WALLET_NAME:-}" || -z "${WALLET_HOTKEY:-}" ]]; then
   exit 1
 fi
 
+find_wallet_miner_pids() {
+  pgrep -f "neurons/miner.py.*--wallet.name ${WALLET_NAME}.*--wallet.hotkey ${WALLET_HOTKEY}" || true
+}
+
+find_wallet_telegram_pids() {
+  pgrep -f "telegram_notifier.py.*--state-file ${TELEGRAM_STATE_FILE}" || true
+}
+
+stop_wallet_miner_pids() {
+  local pids=()
+  local still_running=()
+  mapfile -t pids < <(find_wallet_miner_pids)
+  if [[ "${#pids[@]}" -eq 0 ]]; then
+    return
+  fi
+
+  echo "Stopping pre-existing wallet miner process(es): ${pids[*]}"
+  kill "${pids[@]}" 2>/dev/null || true
+  sleep 2
+
+  for pid in "${pids[@]}"; do
+    if kill -0 "${pid}" 2>/dev/null; then
+      still_running+=("${pid}")
+    fi
+  done
+
+  if [[ "${#still_running[@]}" -gt 0 ]]; then
+    echo "Force killing stubborn wallet miner process(es): ${still_running[*]}"
+    kill -9 "${still_running[@]}" 2>/dev/null || true
+  fi
+}
+
+stop_wallet_telegram_pids() {
+  local pids=()
+  local still_running=()
+  mapfile -t pids < <(find_wallet_telegram_pids)
+  if [[ "${#pids[@]}" -eq 0 ]]; then
+    return
+  fi
+
+  echo "Stopping pre-existing telegram notifier process(es): ${pids[*]}"
+  kill "${pids[@]}" 2>/dev/null || true
+  sleep 2
+
+  for pid in "${pids[@]}"; do
+    if kill -0 "${pid}" 2>/dev/null; then
+      still_running+=("${pid}")
+    fi
+  done
+
+  if [[ "${#still_running[@]}" -gt 0 ]]; then
+    echo "Force killing stubborn telegram notifier process(es): ${still_running[*]}"
+    kill -9 "${still_running[@]}" 2>/dev/null || true
+  fi
+}
+
 pm2 delete sn54-miner >/dev/null 2>&1 || true
 pm2 delete sn54-dashboard >/dev/null 2>&1 || true
 pm2 delete sn54-telegram >/dev/null 2>&1 || true
+stop_wallet_miner_pids
+stop_wallet_telegram_pids
 
 miner_args=(
   neurons/miner.py
@@ -61,32 +119,38 @@ pm2 start "${MINER_ENV_PATH}/bin/python" \
   --error "${MINER_LOG_FILE}" \
   -- "${miner_args[@]}"
 
-dashboard_args=(
-  monitoring/sn54_dashboard.py
-  --host "${DASHBOARD_HOST}"
-  --port "${DASHBOARD_PORT}"
-  --log-file "${MINER_LOG_FILE}"
-  --pid-file "${MINER_PID_FILE}"
-  --axon-port "${MINER_AXON_PORT}"
-  --axon-external-ip "${AXON_EXTERNAL_IP:-}"
-  --axon-external-port "${AXON_EXTERNAL_PORT:-0}"
-  --port-health-enabled "${PORT_HEALTH_ENABLED}"
-  --port-health-check-seconds "${PORT_HEALTH_CHECK_SECONDS}"
-  --port-health-failure-threshold "${PORT_HEALTH_FAILURE_THRESHOLD}"
-  --port-health-recovery-threshold "${PORT_HEALTH_RECOVERY_THRESHOLD}"
-  --port-health-timeout-seconds "${PORT_HEALTH_CONNECT_TIMEOUT_SECONDS}"
-  --port-health-ip-discovery-urls "${PORT_HEALTH_IP_DISCOVERY_URLS}"
-  --port-health-check-url "${PORT_HEALTH_CHECK_URL}"
-)
+dash_enabled="${DASHBOARD_ENABLED,,}"
+dashboard_started=false
+if [[ "${dash_enabled}" == "1" || "${dash_enabled}" == "true" || "${dash_enabled}" == "yes" ]]; then
+  dashboard_args=(
+    monitoring/sn54_dashboard.py
+    --host "${DASHBOARD_HOST}"
+    --port "${DASHBOARD_PORT}"
+    --log-file "${MINER_LOG_FILE}"
+    --pid-file "${MINER_PID_FILE}"
+    --axon-port "${MINER_AXON_PORT}"
+    --axon-external-ip "${AXON_EXTERNAL_IP:-}"
+    --axon-external-port "${AXON_EXTERNAL_PORT:-0}"
+    --port-health-enabled "${PORT_HEALTH_ENABLED}"
+    --port-health-check-seconds "${PORT_HEALTH_CHECK_SECONDS}"
+    --port-health-failure-threshold "${PORT_HEALTH_FAILURE_THRESHOLD}"
+    --port-health-recovery-threshold "${PORT_HEALTH_RECOVERY_THRESHOLD}"
+    --port-health-timeout-seconds "${PORT_HEALTH_CONNECT_TIMEOUT_SECONDS}"
+    --port-health-ip-discovery-urls "${PORT_HEALTH_IP_DISCOVERY_URLS}"
+    --port-health-check-url "${PORT_HEALTH_CHECK_URL}"
+  )
 
-pm2 start "${MINER_ENV_PATH}/bin/python" \
-  --name sn54-dashboard \
-  --cwd "${PROJECT_ROOT}" \
-  --interpreter none \
-  --time \
-  --output "${DASHBOARD_LOG_FILE}" \
-  --error "${DASHBOARD_LOG_FILE}" \
-  -- "${dashboard_args[@]}"
+  pm2 start "${MINER_ENV_PATH}/bin/python" \
+    --name sn54-dashboard \
+    --cwd "${PROJECT_ROOT}" \
+    --interpreter none \
+    --time \
+    --output "${DASHBOARD_LOG_FILE}" \
+    --error "${DASHBOARD_LOG_FILE}" \
+    -- "${dashboard_args[@]}"
+
+  dashboard_started=true
+fi
 
 enabled="${TELEGRAM_NOTIFIER_ENABLED,,}"
 if [[ "${enabled}" == "1" || "${enabled}" == "true" || "${enabled}" == "yes" ]]; then
@@ -135,14 +199,19 @@ fi
 sleep 1
 
 miner_pid="$(pm2 pid sn54-miner | tail -n 1 | tr -d '[:space:]' || true)"
-dash_pid="$(pm2 pid sn54-dashboard | tail -n 1 | tr -d '[:space:]' || true)"
 tele_pid="$(pm2 pid sn54-telegram | tail -n 1 | tr -d '[:space:]' || true)"
+dash_pid=""
+if [[ "${dashboard_started}" == "true" ]]; then
+  dash_pid="$(pm2 pid sn54-dashboard | tail -n 1 | tr -d '[:space:]' || true)"
+fi
 
 if [[ -n "${miner_pid}" && "${miner_pid}" != "0" ]]; then
   echo "${miner_pid}" > "${MINER_PID_FILE}"
 fi
 if [[ -n "${dash_pid}" && "${dash_pid}" != "0" ]]; then
   echo "${dash_pid}" > "${DASHBOARD_PID_FILE}"
+else
+  rm -f "${DASHBOARD_PID_FILE}"
 fi
 if [[ -n "${tele_pid}" && "${tele_pid}" != "0" ]]; then
   echo "${tele_pid}" > "${TELEGRAM_PID_FILE}"
@@ -152,5 +221,9 @@ pm2 save >/dev/null 2>&1 || true
 
 echo "PM2 SN54 stack started."
 echo "Miner log: ${MINER_LOG_FILE}"
-echo "Dashboard: http://${DASHBOARD_HOST}:${DASHBOARD_PORT}"
+if [[ "${dashboard_started}" == "true" ]]; then
+  echo "Dashboard: http://${DASHBOARD_HOST}:${DASHBOARD_PORT}"
+else
+  echo "Dashboard: disabled (DASHBOARD_ENABLED=${DASHBOARD_ENABLED})"
+fi
 echo "Telegram log: ${TELEGRAM_LOG_FILE}"

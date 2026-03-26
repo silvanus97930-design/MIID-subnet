@@ -49,8 +49,11 @@ _get_pipeline(); adjust prompts if the model expects different wording.
 """
 
 import os
-from typing import List, Dict, Any
+import threading
+from contextlib import nullcontext
+from typing import Any, Dict, List
 
+import bittensor as bt
 import torch
 from diffusers import Flux2KleinPipeline
 from PIL import Image
@@ -59,28 +62,82 @@ from PIL import Image
 # Configuration (parameters you can change)
 # -----------------------------------------------------------------------------
 
+
+def _normalize_device_name(device_name: str) -> str:
+    value = (device_name or "").strip().lower()
+    if not value:
+        return ""
+    if value.startswith("cuda") and not torch.cuda.is_available():
+        bt.logging.warning(
+            f"FLUX_DEVICE={device_name} requested but CUDA is unavailable. Falling back to CPU."
+        )
+        return "cpu"
+    return value
+
+
+def _resolve_device() -> str:
+    requested = _normalize_device_name(os.environ.get("FLUX_DEVICE", ""))
+    if requested:
+        return requested
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _parse_dtype(name: str) -> torch.dtype | None:
+    normalized = (name or "").strip().lower()
+    mapping = {
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    return mapping.get(normalized)
+
+
+def _resolve_dtype(device: str) -> torch.dtype:
+    requested = _parse_dtype(os.environ.get("FLUX_DTYPE", "auto"))
+    if requested is not None:
+        if requested in (torch.float16, torch.bfloat16) and not device.startswith("cuda"):
+            bt.logging.warning(
+                "FLUX_DTYPE requested GPU-only precision on non-CUDA device. Falling back to float32."
+            )
+            return torch.float32
+        return requested
+
+    if device.startswith("cuda"):
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    return torch.float32
+
+
 # Device: "cuda" for NVIDIA GPU, "mps" for Apple Silicon, "cpu" for CPU-only.
 # GPU is strongly recommended for acceptable speed.
-DEVICE = os.environ.get("FLUX_DEVICE", "cpu")
+DEVICE = _resolve_device()
 
 # dtype: torch.float32 (safest), torch.float16 or torch.bfloat16 (less memory,
 # faster on GPU). Use float32 on CPU; float16/bfloat16 on GPU if supported.
-DTYPE = torch.float32
+DTYPE = _resolve_dtype(DEVICE)
 
 # Hugging Face model ID. This is the base miner model; change if using another
 # FLUX or compatible diffusion model (see docstring for alternatives).
-MODEL_ID = "black-forest-labs/FLUX.2-klein-4B"
+MODEL_ID = os.environ.get("FLUX_MODEL_ID", "black-forest-labs/FLUX.2-klein-4B")
 
 # Inference steps: more steps = higher quality, slower. Typical range 20–50.
 # Lower (e.g. 20) for speed; higher for quality.
-NUM_INFERENCE_STEPS = 20
+NUM_INFERENCE_STEPS = int(os.environ.get("FLUX_NUM_INFERENCE_STEPS", "20"))
 
 # Guidance scale: how closely the output follows the prompt. Typical 3.5–7.5.
 # Higher = stronger adherence to prompt; lower = more variation.
-GUIDANCE_SCALE = 3.5
+GUIDANCE_SCALE = float(os.environ.get("FLUX_GUIDANCE_SCALE", "3.5"))
 
 # Default intensity when the caller does not specify one (light / medium / far).
 DEFAULT_INTENSITY = "medium"
+
+# When true, only one image-request batch is processed at a time. This avoids
+# memory spikes when multiple validators hit Phase 4 concurrently.
+SERIALIZE_VARIATION_REQUESTS = (
+    os.environ.get("FLUX_SERIALIZE_REQUESTS", "true").strip().lower() in {"1", "true", "yes"}
+)
 
 # -----------------------------------------------------------------------------
 # Prompts: use protocol text from validator (single source of truth)
@@ -91,6 +148,7 @@ DEFAULT_INTENSITY = "medium"
 
 # Lazy-loaded pipeline (loaded on first use to avoid requiring HF token at import).
 _pipe: Flux2KleinPipeline | None = None
+_PIPE_LOCK = threading.Lock()
 
 
 def _get_pipeline() -> Flux2KleinPipeline:
@@ -109,8 +167,18 @@ def _get_pipeline() -> Flux2KleinPipeline:
     pipe_kwargs: Dict[str, Any] = {
         "torch_dtype": DTYPE,
         "token": token,
+        "low_cpu_mem_usage": True,
     }
+    bt.logging.info(
+        f"Initializing FLUX pipeline model={MODEL_ID} device={DEVICE} dtype={DTYPE}"
+    )
     _pipe = Flux2KleinPipeline.from_pretrained(MODEL_ID, **pipe_kwargs)
+    if hasattr(_pipe, "enable_attention_slicing"):
+        _pipe.enable_attention_slicing()
+    if hasattr(_pipe, "enable_vae_slicing"):
+        _pipe.enable_vae_slicing()
+    if hasattr(_pipe, "enable_vae_tiling"):
+        _pipe.enable_vae_tiling()
     _pipe = _pipe.to(DEVICE)
     return _pipe
 
@@ -134,6 +202,39 @@ def _get_prompt_from_request(req: Any, var_type: str, intensity: str) -> str:
     if parts:
         return f"Same person, same identity, {', '.join(parts)}. Preserve face identity."
     return f"Same person, same identity, {var_type} variation ({intensity} intensity). Preserve face identity."
+
+
+def _generation_lock_context():
+    return _PIPE_LOCK if SERIALIZE_VARIATION_REQUESTS else nullcontext()
+
+
+def prewarm_pipeline() -> None:
+    """Optional one-time warm-up to reduce first real request latency."""
+    warm_enabled = os.environ.get("FLUX_PREWARM_INFERENCE", "true").strip().lower() in {"1", "true", "yes", "on"}
+    warm_steps = max(1, int(os.environ.get("FLUX_PREWARM_STEPS", "2")))
+    warm_prompt = os.environ.get(
+        "FLUX_PREWARM_PROMPT",
+        "Same person, same identity, neutral passport photo with slight expression change. Preserve face identity.",
+    )
+
+    with _generation_lock_context():
+        pipe = _get_pipeline()
+        if not warm_enabled:
+            bt.logging.info("FLUX prewarm: pipeline loaded (inference warm-up disabled)")
+            return
+
+        warm_image = Image.new("RGB", (384, 512), color=(128, 128, 128))
+        bt.logging.info(f"FLUX prewarm: running warm-up inference (steps={warm_steps})")
+        with torch.inference_mode():
+            _ = pipe(
+                prompt=warm_prompt,
+                image=[warm_image],
+                num_inference_steps=warm_steps,
+                guidance_scale=max(1.0, min(GUIDANCE_SCALE, 3.0)),
+            )
+
+        if DEVICE.startswith("cuda"):
+            torch.cuda.empty_cache()
 
 
 def generate_variations(
@@ -169,28 +270,34 @@ def generate_variations(
     if not variation_requests:
         return []
 
-    pipe = _get_pipeline()
-    results: List[Dict[str, Any]] = []
+    with _generation_lock_context():
+        pipe = _get_pipeline()
+        results: List[Dict[str, Any]] = []
 
-    for req in variation_requests:
-        var_type, intensity = _get_type_and_intensity(req)
-        prompt = _get_prompt_from_request(req, var_type, intensity)
+        for req in variation_requests:
+            var_type, intensity = _get_type_and_intensity(req)
+            prompt = _get_prompt_from_request(req, var_type, intensity)
 
-        try:
-            # Run the diffusion pipeline: base image + prompt -> one variation image
-            out = pipe(
-                prompt=prompt,
-                image=[base_image],
-                num_inference_steps=NUM_INFERENCE_STEPS,
-                guidance_scale=GUIDANCE_SCALE,
-            )
-            gen_image = out.images[0]
-        except Exception as e:
-            raise RuntimeError(f"FLUX variation failed for {var_type}({intensity}): {e}") from e
+            try:
+                # Run the diffusion pipeline: base image + prompt -> one variation image.
+                with torch.inference_mode():
+                    out = pipe(
+                        prompt=prompt,
+                        image=[base_image],
+                        num_inference_steps=NUM_INFERENCE_STEPS,
+                        guidance_scale=GUIDANCE_SCALE,
+                    )
+                gen_image = out.images[0]
+            except Exception as e:
+                raise RuntimeError(f"FLUX variation failed for {var_type}({intensity}): {e}") from e
 
-        results.append({
-            "image": gen_image,
-            "variation_type": var_type,
-        })
+            results.append({
+                "image": gen_image,
+                "variation_type": var_type,
+            })
 
-    return results
+        if DEVICE.startswith("cuda"):
+            # Helps avoid VRAM fragmentation across long-running miner sessions.
+            torch.cuda.empty_cache()
+
+        return results
