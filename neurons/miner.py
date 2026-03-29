@@ -66,7 +66,7 @@ import os
 import numpy as np
 from typing import List, Dict, Tuple, Any, Optional
 from datetime import datetime, timedelta
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, OrderedDict
 from tqdm import tqdm
 from PIL import Image
 
@@ -107,6 +107,7 @@ from MIID.miner.image_generator import (
 )
 from MIID.miner.drand_encrypt import encrypt_image_for_drand, is_timelock_available
 from MIID.miner.s3_upload import upload_to_s3
+from MIID.miner import kav_helpers
 
 
 class Miner(BaseMinerNeuron):
@@ -815,7 +816,44 @@ class Miner(BaseMinerNeuron):
             f"KAV validator reranker for '{seed_name}': pool={len(candidates)}, selected={len(selected_infos)}, "
             f"rule_target={rule_target_count}, phonetic_targets={desired_phonetic}, orthographic_targets={desired_orthographic}"
         )
-        return [info["name"] for info in selected_infos[:target_count]]
+        names = [info["name"] for info in selected_infos[:target_count]]
+        if len(names) < target_count:
+            seen_norm = {n.lower().strip() for n in names if n}
+            for info in infos:
+                if len(names) >= target_count:
+                    break
+                n = (info.get("name") or "").strip()
+                if not n:
+                    continue
+                if n.lower() in seen_norm:
+                    continue
+                seen_norm.add(n.lower())
+                names.append(n)
+        if len(names) < target_count:
+            for info in infos:
+                if len(names) >= target_count:
+                    break
+                n = (info.get("name") or "").strip()
+                if not n:
+                    continue
+                names.append(n)
+        # Pool may be smaller than target_count: repeat best available names until full.
+        if len(names) < target_count and infos:
+            idx = 0
+            max_iters = max(target_count * max(len(infos), 1) * 2, 64)
+            it = 0
+            while len(names) < target_count and it < max_iters:
+                it += 1
+                n = (infos[idx % len(infos)].get("name") or "").strip()
+                idx += 1
+                if n:
+                    names.append(n)
+        if len(names) < target_count:
+            bt.logging.warning(
+                f"KAV name selector: still short {len(names)}/{target_count} for seed={seed_name!r}; "
+                "pad layer must complete the count."
+            )
+        return names[:target_count]
 
     @staticmethod
     def _normalize_name_text(raw_name: str) -> str:
@@ -1481,51 +1519,192 @@ class Miner(BaseMinerNeuron):
             add_candidate(" ".join(generated).strip())
 
         if not cleaned:
-            return []
+            return self._pad_exact_name_rows(seed_name, [], [], target_count, query_template)
 
         selected = self._select_validator_aligned_names(seed_name, cleaned, target_count, query_template)
-        if selected:
-            return selected[:target_count]
-        return cleaned[:target_count]
+        base_order = selected if selected else cleaned
+        padded = self._pad_exact_name_rows(seed_name, base_order, cleaned, target_count, query_template)
+        if len(padded) < target_count and target_count > 0:
+            bt.logging.error(
+                f"KAV _ensure_target_name_count: pad short {len(padded)}/{target_count} for {seed_name!r}; forcing."
+            )
+            padded = self._force_pad_names_to_count(seed_name, padded, target_count)
+        return padded[:target_count]
 
-    def _build_dob_variations(self, seed_dob: str, target_count: int) -> List[str]:
-        """Build DOB variations covering validator scoring buckets."""
+    def _force_pad_names_to_count(
+        self,
+        seed_name: str,
+        partial: List[str],
+        target_count: int,
+    ) -> List[str]:
+        """
+        Absolute last resort when selector/pad still return fewer than target_count names.
+        Uses letter-only suffixes (no digits) to avoid validator name-token digit rules.
+        """
+        out = list(partial or [])
         if target_count <= 0:
             return []
-        try:
-            base = datetime.strptime(seed_dob.strip(), "%Y-%m-%d")
-        except Exception:
-            fallback = seed_dob.strip() if seed_dob and seed_dob.strip() else "1990-01-01"
-            return [fallback for _ in range(target_count)]
+        seen = {x.lower().strip() for x in out if x}
+        seed_clean = (seed_name or "").strip() or "Name"
+        seed_low = seed_clean.lower()
+        parts = [p for p in seed_clean.split() if p.strip()] or [seed_clean]
+        is_multipart = len(parts) > 1
+        k = 0
+        while len(out) < target_count:
+            k += 1
+            suf = "a" * ((k % 12) + 1) + ("b" * (k // 12))
+            if is_multipart:
+                candidate = " ".join(parts[:-1] + [f"{parts[-1]}{suf}"])
+            else:
+                candidate = f"{parts[0]}{suf}"
+            candidate = self._normalize_name_text(candidate)
+            if not candidate:
+                candidate = f"{seed_clean}{suf}"
+            low = candidate.lower()
+            if low in seen or low == seed_low:
+                candidate = f"{seed_clean} {suf}"
+                candidate = self._normalize_name_text(candidate) or f"{seed_clean} {suf}"
+                low = candidate.lower()
+            seen.add(low)
+            out.append(candidate)
+        return out[:target_count]
 
-        categories = [
-            base + timedelta(days=1),
-            base - timedelta(days=3),
-            base + timedelta(days=30),
-            base - timedelta(days=90),
-            base + timedelta(days=365),
-        ]
-        dob_values = [d.strftime("%Y-%m-%d") for d in categories]
-        dob_values.append(base.strftime("%Y-%m"))
+    def _pad_exact_name_rows(
+        self,
+        seed_name: str,
+        ordered_names: List[str],
+        cleaned_pool: List[str],
+        target_count: int,
+        query_template: str,
+    ) -> List[str]:
+        """Guarantee exactly target_count unique valid name variations (deterministic padding)."""
+        if target_count <= 0:
+            return []
+        is_multipart = len(seed_name.split()) > 1
+        requested_rules = self._extract_requested_transformations(query_template)
+        seen: set = set()
+        out: List[str] = []
 
-        extra_offsets = [2, -7, 14, -21, 45, -120, 180, -240, 330, -360]
-        for offset in extra_offsets:
-            dob_values.append((base + timedelta(days=offset)).strftime("%Y-%m-%d"))
+        def push(raw: str) -> bool:
+            candidate = self._clean_name_candidate(
+                raw, seed_name, is_multipart, requested_rules=requested_rules
+            )
+            if not candidate:
+                return False
+            key = candidate.lower()
+            if key in seen:
+                return False
+            if key == seed_name.strip().lower():
+                return False
+            seen.add(key)
+            out.append(candidate)
+            return True
 
-        deduped = []
-        seen = set()
-        for dob in dob_values:
-            if dob in seen:
+        for n in ordered_names:
+            if len(out) >= target_count:
+                break
+            push(n)
+        for n in cleaned_pool:
+            if len(out) >= target_count:
+                break
+            push(n)
+
+        seed_parts = [p for p in seed_name.split() if p.strip()]
+        attempt = 0
+        while len(out) < target_count and attempt < 8000:
+            attempt += 1
+            if not seed_parts:
+                break
+            for pi, part in enumerate(seed_parts):
+                if len(out) >= target_count:
+                    break
+                for mut in self._mutate_name_part(part):
+                    if len(out) >= target_count:
+                        break
+                    built = seed_parts.copy()
+                    built[pi] = mut
+                    push(" ".join(built).strip())
+            # extra deterministic perturbations (same machinery as pool expansion)
+            part_idx = attempt % max(len(seed_parts), 1)
+            part = seed_parts[part_idx]
+            mode = attempt % 5
+            if len(part) < 2:
                 continue
-            seen.add(dob)
-            deduped.append(dob)
-            if len(deduped) >= target_count:
-                return deduped[:target_count]
+            if mode == 0 and len(part) > 2:
+                chars = list(part)
+                i = attempt % (len(chars) - 1)
+                chars[i], chars[i + 1] = chars[i + 1], chars[i]
+                perturb = "".join(chars)
+            elif mode == 1:
+                perturb = part[:-1] if len(part) > 1 else part + "x"
+            elif mode == 2:
+                perturb = part + ("a" if attempt % 2 == 0 else "e")
+            elif mode == 3:
+                perturb = part[0] + part[1:-1] + part[-1] if len(part) > 3 else part + "s"
+            else:
+                perturb = part[: len(part) // 2] + part[len(part) // 2 + 1 :]
+            perturb = self._apply_word_case(part, perturb)
+            bp = seed_parts.copy()
+            bp[part_idx] = perturb
+            push(" ".join(bp).strip())
 
-        while len(deduped) < target_count:
-            jitter = (len(deduped) + 1) * 11
-            deduped.append((base + timedelta(days=jitter)).strftime("%Y-%m-%d"))
-        return deduped[:target_count]
+        if len(out) < target_count:
+            bt.logging.warning(
+                f"KAV name pad: could only produce {len(out)}/{target_count} for seed={seed_name!r}; "
+                "using minimal suffix variants."
+            )
+            pad_i = 0
+            while len(out) < target_count and seed_parts:
+                pad_i += 1
+                sfx = f"X{pad_i}"
+                bp = seed_parts[:-1] + [seed_parts[-1] + sfx]
+                if is_multipart:
+                    push(" ".join(bp))
+                else:
+                    push(seed_parts[0] + sfx)
+
+        def push_loose(raw: str) -> bool:
+            """Last resort: normalized unique string, distinct from seed; skips strict name-like checks."""
+            candidate = self._normalize_name_text(str(raw))
+            if not candidate:
+                return False
+            key = candidate.lower()
+            if key in seen:
+                return False
+            if key == seed_name.strip().lower():
+                return False
+            seen.add(key)
+            out.append(candidate)
+            return True
+
+        if len(out) < target_count:
+            bt.logging.warning(
+                f"KAV name pad: permissive fill for seed={seed_name!r} ({len(out)}/{target_count})"
+            )
+            pad_i = 0
+            while len(out) < target_count and seed_parts:
+                pad_i += 1
+                sfx = f"Y{pad_i}"
+                if is_multipart:
+                    bp = seed_parts[:-1] + [seed_parts[-1] + sfx]
+                    push_loose(" ".join(bp))
+                else:
+                    push_loose(seed_parts[0] + sfx)
+        if len(out) < target_count and not seed_parts:
+            base = self._normalize_name_text(seed_name) or "Name"
+            idx = 0
+            while len(out) < target_count:
+                idx += 1
+                push_loose(f"{base} Var{idx}")
+
+        if len(out) < target_count:
+            out = self._force_pad_names_to_count(seed_name, out, target_count)
+
+        return out[:target_count]
+
+    def _build_dob_variations(self, seed_dob: str, target_count: int) -> List[str]:
+        """Deterministic DOB list (no LLM); delegates to kav_helpers."""
+        return kav_helpers.build_dob_variations_deterministic(seed_dob, target_count)
 
     def _resolve_region_target(self, seed_address: str) -> Tuple[str, Optional[str], Optional[str]]:
         """
@@ -1628,28 +1807,82 @@ class Miner(BaseMinerNeuron):
         )
 
     def _build_address_variations(self, seed_address: str, target_count: int) -> List[str]:
-        """Build address variations that satisfy validator heuristics and region checks."""
+        """Build address variations: candidate pool + validator-aligned selection (looks_like + region)."""
         if target_count <= 0:
             return []
         country_name, country_code, preferred_city = self._resolve_region_target(seed_address)
-        addresses = []
-        seen = set()
-        i = 0
-        while len(addresses) < target_count and i < target_count * 8:
-            city = self._pick_city_for_country(country_code, preferred_city, i)
-            candidate = self._make_address_line(city, country_name, i)
-            normalized = candidate.lower().strip()
-            if normalized not in seen:
-                seen.add(normalized)
-                addresses.append(candidate)
-            i += 1
+        sr = kav_helpers.extract_seed_region(
+            seed_address,
+            self._country_name_to_code,
+            self._country_code_to_name,
+            self._country_compact_to_code,
+        )
+        cc = sr.country_code or country_code
+        country_display = self._country_code_to_name.get(cc, sr.country_name) if cc else country_name
+        pref_city = sr.city_hint or preferred_city
 
-        if not addresses:
-            fallback = "120 Central Avenue, District 4, New York 10001, United States"
-            addresses = [fallback for _ in range(target_count)]
-        elif len(addresses) < target_count:
-            addresses.extend([addresses[-1]] * (target_count - len(addresses)))
-        return addresses[:target_count]
+        def pick_city(i: int) -> str:
+            return self._pick_city_for_country(cc, pref_city, i)
+
+        pool_size = max(48, target_count * 6)
+        pool = kav_helpers.generate_address_candidate_pool(
+            seed_address,
+            pool_size,
+            country_display,
+            pick_city,
+            self.STREET_ROOTS,
+            self.STREET_SUFFIXES,
+            self.DISTRICT_WORDS,
+        )
+        chosen: List[str] = []
+        meta: List[Dict[str, Any]] = []
+        try:
+            chosen, meta = kav_helpers.select_best_addresses(pool, seed_address, target_count)
+        except Exception as e:
+            bt.logging.warning(f"KAV address selection failed ({e}); falling back to structured lines.")
+
+        if len(chosen) < target_count:
+            extra = kav_helpers.generate_address_candidate_pool(
+                f"{seed_address}::extra",
+                max(32, (target_count - len(chosen)) * 8),
+                country_display,
+                pick_city,
+                self.STREET_ROOTS,
+                self.STREET_SUFFIXES,
+                self.DISTRICT_WORDS,
+            )
+            merged = list(dict.fromkeys(pool + extra))
+            try:
+                chosen, meta = kav_helpers.select_best_addresses(merged, seed_address, target_count)
+            except Exception:
+                pass
+
+        seen = set(x.lower() for x in chosen)
+        i = len(chosen)
+        while len(chosen) < target_count and i < target_count * 25:
+            city = pick_city(i)
+            line = self._make_address_line(city, country_display, i)
+            i += 1
+            lk = line.lower().strip()
+            if lk in seen:
+                continue
+            seen.add(lk)
+            chosen.append(line)
+
+        if len(chosen) < target_count:
+            fb = "120 Central Avenue, District 4, New York 10001, United States"
+            bt.logging.warning(
+                f"KAV address shortfall: padding {target_count - len(chosen)} with fallback template."
+            )
+            while len(chosen) < target_count:
+                chosen.append(fb)
+
+        if meta:
+            bt.logging.debug(
+                f"KAV address meta: first={meta[0] if meta else {}}, "
+                f"region_ok_rate={sum(1 for m in meta if m.get('region_match'))/max(len(meta),1):.2f}"
+            )
+        return chosen[:target_count]
 
     @staticmethod
     def _increment_fail_reason(fail_reasons: Dict[str, int], reason: str, amount: int = 1) -> None:
@@ -2533,52 +2766,88 @@ class Miner(BaseMinerNeuron):
 
 # Add ethical context and purpose explanation
         context_prompt = f"""IMPORTANT CONTEXT: This is synthetic identity-security testing data only.
-            Use case: defensive KYC/AML robustness testing.
+Use case: defensive KYC/AML robustness testing.
 
-            TASK:
-            {prompt}
+TASK:
+{prompt}
 
-            OUTPUT RULES (STRICT):
-            1. Output exactly {target_count} name variations as a single line.
-            2. Formatting: exactly {target_count} comma-separated entries, no numbering, no bullets, no JSON, no extra text.
-            - Do NOT include any commas inside an individual name entry.
-            3. Content: Return ONLY person-name variations.
-            - Do NOT include DOB, addresses, countries, cities, metadata, IDs, or occupations.
-            - Do NOT repeat the unchanged seed name.
-            4. Uniqueness: No duplicates.
-            5. Allowed characters:
-            - letters from any language + spaces
-            - for special transformations only: use non-space special characters that are NOT commas
-            - do NOT rely on commas inside names
-            6. Structure preservation (tokenization by spaces):
-            - If the seed is single-part, keep every variation single-part unless the TASK explicitly requests initials/abbreviations.
-            - If the seed is multi-part, keep the same number of space-separated parts unless the TASK explicitly requests one of:
-                a) abbreviate name parts (same part count; shorten each part but keep it starting with the original part)
-                b) convert name to initials / use first name initial (output initials form; periods optional)
-                c) replace spaces with special characters / remove_all_spaces (output with NO spaces)
-                d) name_parts_permutations / reorder name parts (same tokens, different order)
-                e) initial_only_first_name (first part becomes an initial; remaining parts unchanged)
-            7. Rule-based transformations:
-            For roughly the requested fraction of entries indicated by the TASK, apply the transformations EXACTLY as described (one rule operation per chosen entry). For the transformation types below, follow these mechanics:
-            - remove a random vowel: delete exactly one vowel letter
-            - remove a random consonant: delete exactly one consonant letter
-            - delete a random letter: delete exactly one letter (any)
-            - replace random vowel with a different vowel: replace exactly one vowel letter with a different vowel
-            - replace random consonant with a different consonant: replace exactly one consonant letter with a different consonant
-            - replace double letters with a single letter: remove exactly one character from a double-letter run (length decreases by 1 at that spot)
-            - swap adjacent consonants: swap exactly one eligible adjacent consonant pair (length unchanged)
-            - abbreviate name parts: keep part count; each part shorter but still starts with the original part
-            - convert name to initials: output initials for all parts (e.g., "JD" or "J.D" style; periods optional)
-            - use first name initial with last name: first part becomes an initial, rest unchanged
-            - replace spaces with special characters: output with NO spaces; replace each original space with ONE non-space special character (prefer `_` or similar; never use comma)
-            - add a title prefix: prepend ONE of: Mr, Mrs, Ms, Miss, Dr, Prof, Sir, Lady, Lord, Dame, Master, Mistress
-            - add a title suffix: append ONE of: Jr, Sr, III, IV, V, PhD, MD (avoid title forms that require punctuation)
-            - remove title: if the seed has a title from the prefix list above, remove it
-            - remove a random special character: if the seed contains a removable special character, remove exactly one such character
-            8. If the TASK includes phonetic/orthographic Light/Medium/Far distributions:
-            - prioritize generating plausible names that match the requested similarity levels.
-            - overall distribution should be approximately respected across the {target_count} outputs.
-        """
+OUTPUT RULES (STRICT):
+1. Return exactly {target_count} unique person-name variations in ONE line.
+2. Output format: exactly {target_count} comma-separated entries.
+3. No numbering, no bullets, no JSON, no explanations, no extra text.
+4. Do NOT include DOB, address, city, country, IDs, metadata, occupations, or commentary.
+5. Do NOT repeat the unchanged seed name.
+6. Do NOT use commas inside an individual name entry.
+7. Allowed characters:
+   - letters from the original script/language
+   - spaces
+   - only when explicitly needed for a requested special-character transformation: `_` `-` `.`
+8. Preserve the seed script unless the TASK explicitly requires a structure-changing transformation.
+   - Do not randomly transliterate.
+   - Do not mix scripts inside one entry.
+
+PRIORITY ORDER:
+A. exact count
+B. valid name-only entries
+C. uniqueness
+D. requested rule-based quota
+E. phonetic/orthographic distribution fit
+
+INTERNAL PLANNING RULE:
+Before generating, internally decide:
+- how many entries must be rule-based
+- how many should target Light / Medium / Far phonetic similarity
+- how many should target Light / Medium / Far orthographic similarity
+Then generate the final list to satisfy those quotas as closely as possible.
+
+SIMILARITY GUIDANCE:
+- Light = one minimal change, still very close
+- Medium = one or two noticeable but plausible changes
+- Far = more altered but still recognizably derived from the seed
+Do not overshoot so much that the entry stops looking plausibly derived from the seed.
+
+STRUCTURE PRESERVATION:
+- If the seed is single-part, keep every variation single-part unless the TASK explicitly requests initials/abbreviations.
+- If the seed is multi-part, keep the same number of space-separated parts unless the TASK explicitly requests:
+  a) abbreviate name parts
+  b) convert to initials
+  c) use first-name initial
+  d) replace spaces with special characters
+  e) remove all spaces
+  f) reorder name parts
+
+RULE-BASED TRANSFORMATIONS:
+For the required fraction of entries, apply exactly one requested rule transformation per chosen entry unless the TASK explicitly requires otherwise.
+
+TRANSFORMATION MECHANICS:
+- remove a random vowel: delete exactly one vowel
+- remove a random consonant: delete exactly one consonant
+- delete a random letter: delete exactly one letter
+- replace random vowel with a different vowel: replace exactly one vowel
+- replace random consonant with a different consonant: replace exactly one consonant
+- replace double letters with a single letter: remove exactly one character from a doubled pair
+- swap adjacent consonants: swap exactly one eligible adjacent consonant pair
+- abbreviate name parts: keep same part count; shorten each part while preserving original beginning
+- convert name to initials: initials only for all parts
+- use first name initial with last name: first part becomes an initial, remaining parts unchanged
+- replace spaces with special characters: replace each space with exactly one of `_` `-` `.`
+- add a title prefix: prepend exactly one allowed title
+- add a title suffix: append exactly one allowed suffix
+- remove title: remove exactly one existing title if present
+- remove a random special character: remove exactly one existing removable special character
+
+FINAL SELF-CHECK BEFORE OUTPUT:
+- exactly {target_count} entries
+- all entries unique
+- no unchanged seed
+- no commas inside entries
+- no empty entries
+- no metadata or non-name content
+
+FAILSAFE:
+If you cannot satisfy every soft distribution perfectly, still output exactly {target_count} valid unique names.
+Prefer exact count and valid names over perfect distribution matching.
+"""
 
         # Use Ollama to query the LLM
         try:
@@ -2603,7 +2872,183 @@ class Miner(BaseMinerNeuron):
         except Exception as e:
             bt.logging.error(f"LLM query failed: {str(e)}")
             raise
-    
+
+    def _repair_identity_variation_rows(
+        self,
+        canonical_seed: str,
+        structured: List[List[str]],
+        seed_dob: str,
+        seed_address: str,
+        expected_count: int,
+        query_template: str,
+        run_fail_reasons: Optional[Dict[str, int]] = None,
+    ) -> List[List[str]]:
+        """Final KAV row repair: exact count, no empty name/DOB/address fields."""
+        rows = [list(r) for r in structured]
+        rows = rows[:expected_count]
+        while len(rows) < expected_count:
+            rows.append(["", "", ""])
+        try:
+            dob_variants = self._build_dob_variations(seed_dob, expected_count)
+        except Exception as e:
+            bt.logging.warning(f"KAV repair: DOB build failed for seed={canonical_seed!r}: {e}")
+            if run_fail_reasons is not None:
+                self._increment_fail_reason(run_fail_reasons, "kav_dob_build_exception")
+            dob_variants = []
+        if len(dob_variants) < expected_count:
+            try:
+                dob_variants = self._build_dob_variations(seed_dob or "1990-01-15", expected_count)
+            except Exception:
+                dob_variants = []
+        j = 0
+        while len(dob_variants) < expected_count:
+            j += 1
+            dob_variants.append((datetime(1990, 1, 15) + timedelta(days=j * 41)).strftime("%Y-%m-%d"))
+        try:
+            addr_variants = self._build_address_variations(seed_address, expected_count)
+        except Exception as e:
+            bt.logging.warning(
+                f"KAV repair: address rebuild failed for seed={canonical_seed!r}: {e}; using structured fallback lines."
+            )
+            if run_fail_reasons is not None:
+                self._increment_fail_reason(run_fail_reasons, "kav_address_rebuild_exception")
+            cn, cc, pc = self._resolve_region_target(seed_address)
+            addr_variants = [
+                self._make_address_line(self._pick_city_for_country(cc, pc, i), cn, i + 17)
+                for i in range(expected_count)
+            ]
+        if len(addr_variants) < expected_count:
+            cn, cc, pc = self._resolve_region_target(seed_address)
+            i0 = len(addr_variants)
+            while len(addr_variants) < expected_count:
+                addr_variants.append(
+                    self._make_address_line(self._pick_city_for_country(cc, pc, i0), cn, i0 + 31)
+                )
+                i0 += 1
+        for i in range(expected_count):
+            while len(rows[i]) < 3:
+                rows[i].append("")
+            n = str(rows[i][0]).strip() if len(rows[i]) > 0 else ""
+            d = str(rows[i][1]).strip() if len(rows[i]) > 1 else ""
+            a = str(rows[i][2]).strip() if len(rows[i]) > 2 else ""
+            if not n:
+                fb = self._pad_exact_name_rows(canonical_seed, [], [], 1, query_template)
+                n = fb[0] if fb else (self._normalize_name_text(canonical_seed) or "Name")
+                if not n:
+                    forced = self._force_pad_names_to_count(canonical_seed, [], 1)
+                    n = forced[0] if forced else "Name"
+                if run_fail_reasons is not None:
+                    self._increment_fail_reason(run_fail_reasons, "kav_row_name_repair")
+            if not d:
+                d = dob_variants[i] if i < len(dob_variants) else (seed_dob or "1990-01-01")
+            if not str(d).strip():
+                d = (datetime(1990, 1, 15) + timedelta(days=i * 17 + 1)).strftime("%Y-%m-%d")
+            if not a:
+                a = addr_variants[i] if i < len(addr_variants) else (
+                    seed_address
+                    or "120 Central Avenue, District 4, New York 10001, United States"
+                )
+            if not str(a).strip():
+                cn, cc, pc = self._resolve_region_target(seed_address)
+                a = self._make_address_line(self._pick_city_for_country(cc, pc, i + 5), cn, i + 99)
+            rows[i] = [str(n).strip(), str(d).strip(), str(a).strip()]
+        return rows
+
+    def _finalize_kav_output_order(
+        self,
+        name_variations: Dict[str, List[List[str]]],
+        identity_list: List[List[str]],
+        expected_count: int,
+        query_template: str,
+        run_fail_reasons: Optional[Dict[str, int]] = None,
+    ) -> "OrderedDict[str, List[List[str]]]":
+        """
+        Validator pairs seed DOB/address lists with enumerate(variations.keys()) order.
+        Build an OrderedDict in the same order as synapse.identity so name_idx aligns with seed_* arrays.
+        """
+        if run_fail_reasons is None:
+            run_fail_reasons = {}
+        ordered: OrderedDict[str, List[List[str]]] = OrderedDict()
+        for identity in identity_list:
+            if not identity:
+                continue
+            seed = str(identity[0]).strip()
+            if not seed:
+                continue
+            sd = str(identity[1]).strip() if len(identity) > 1 else ""
+            sa = str(identity[2]).strip() if len(identity) > 2 else ""
+            rows = name_variations.get(seed) or []
+            ordered[seed] = self._repair_identity_variation_rows(
+                seed,
+                rows,
+                sd,
+                sa,
+                expected_count,
+                query_template,
+                run_fail_reasons=run_fail_reasons,
+            )
+        return ordered
+
+    def _kav_fill_missing_identities(
+        self,
+        name_variations: Dict[str, List[List[str]]],
+        identity_list: List[List[str]],
+        expected_count: int,
+        query_template: str,
+        run_fail_reasons: Optional[Dict[str, int]] = None,
+    ) -> Dict[str, List[List[str]]]:
+        """Ensure every requested identity key exists with full row count (deterministic synthesis)."""
+        out = dict(name_variations)
+        for identity in identity_list:
+            if not identity:
+                continue
+            seed = str(identity[0]).strip()
+            if not seed:
+                continue
+            cur = out.get(seed) or []
+            if cur and len(cur) >= expected_count:
+                continue
+            bt.logging.warning(f"KAV synthesizing missing/short identity rows for seed={seed!r}")
+            if run_fail_reasons is not None:
+                self._increment_fail_reason(run_fail_reasons, "kav_identity_synthesized")
+            seed_dob = str(identity[1]).strip() if len(identity) > 1 else ""
+            seed_addr = str(identity[2]).strip() if len(identity) > 2 else ""
+            names = self._ensure_target_name_count(seed, [], expected_count, query_template=query_template)
+            if len(names) < expected_count:
+                names = self._force_pad_names_to_count(seed, names, expected_count)
+            try:
+                dob_variants = self._build_dob_variations(seed_dob, expected_count)
+            except Exception as e:
+                bt.logging.warning(f"KAV fill: DOB build failed for seed={seed!r}: {e}")
+                dob_variants = []
+            dj = 0
+            while len(dob_variants) < expected_count:
+                dj += 1
+                dob_variants.append((datetime(1990, 1, 15) + timedelta(days=dj * 37)).strftime("%Y-%m-%d"))
+            try:
+                addr_variants = self._build_address_variations(seed_addr, expected_count)
+            except Exception as e:
+                bt.logging.warning(f"KAV fill: address build failed for seed={seed!r}: {e}")
+                if run_fail_reasons is not None:
+                    self._increment_fail_reason(run_fail_reasons, "kav_address_build_exception_fill")
+                cn, cc, pc = self._resolve_region_target(seed_addr)
+                addr_variants = [
+                    self._make_address_line(self._pick_city_for_country(cc, pc, j), cn, j + 9)
+                    for j in range(expected_count)
+                ]
+            structured: List[List[str]] = []
+            for idx in range(expected_count):
+                structured.append(
+                    [
+                        names[idx] if idx < len(names) else seed,
+                        dob_variants[idx] if idx < len(dob_variants) else seed_dob,
+                        addr_variants[idx] if idx < len(addr_variants) else seed_addr,
+                    ]
+                )
+            # Final repair happens in _finalize_kav_output_order (single pass, avoids double address rebuild).
+            out[seed] = structured
+        return out
+
     def process_variations(
         self,
         Response_list: List[str],
@@ -2659,6 +3104,7 @@ class Miner(BaseMinerNeuron):
                 identity_candidates.append((seed_name, canonical_seed, identity))
 
         name_variations: Dict[str, List[List[str]]] = {}
+        kav_per_identity_stats: Dict[str, Dict[str, Any]] = {}
 
         for i in range(1, len(responds)):
             try:
@@ -2688,55 +3134,151 @@ class Miner(BaseMinerNeuron):
                     self._increment_fail_reason(run_fail_reasons, "identity_match_miss")
                     continue
 
-                canonical_seed_name = matched_seed_name or seed_name
+                # Validator keys must match synapse.identity[i][0] exactly (Unicode/casing).
+                storage_key = str(matching_identity[0]).strip()
                 seed_dob = str(matching_identity[1]).strip() if len(matching_identity) > 1 else ""
                 seed_address = str(matching_identity[2]).strip() if len(matching_identity) > 2 else ""
 
                 raw_name_variations = [var for var in llm_respond[2] if not pd.isna(var) and str(var).strip()]
                 names = self._ensure_target_name_count(
-                    canonical_seed_name,
+                    storage_key,
                     raw_name_variations,
                     expected_count,
                     query_template=query_template,
                 )
                 if not names:
-                    bt.logging.warning(f"No valid name variations for {canonical_seed_name}; skipping")
+                    bt.logging.warning(f"No valid name variations for {storage_key}; using deterministic synthesis")
                     self._increment_fail_reason(run_fail_reasons, "no_valid_name_variations")
-                    name_variations[canonical_seed_name] = []
-                    continue
+                    names = self._pad_exact_name_rows(storage_key, [], [], expected_count, query_template)
+                if not names:
+                    bt.logging.error(f"KAV: name pad still empty for {storage_key}; using deterministic token variants.")
+                    self._increment_fail_reason(run_fail_reasons, "name_pad_empty_critical")
+                    base = self._normalize_name_text(storage_key) or "Name"
+                    names = [f"{base} Var{i}" for i in range(expected_count)]
 
-                target_count = min(expected_count, len(names))
-                names = names[:target_count]
-                if target_count < expected_count:
-                    self._increment_fail_reason(
-                        run_fail_reasons,
-                        "variation_shortfall",
-                        expected_count - target_count,
+                target_count = expected_count
+                if len(names) < target_count:
+                    names = self._pad_exact_name_rows(
+                        storage_key, names, names, target_count, query_template
                     )
+                names = names[:target_count]
+                if len(names) < target_count:
+                    names = self._force_pad_names_to_count(storage_key, names, target_count)
 
-                dob_variants = self._build_dob_variations(seed_dob, target_count)
-                address_variants = self._build_address_variations(seed_address, target_count)
+                try:
+                    dob_variants = self._build_dob_variations(seed_dob, target_count)
+                except Exception as e:
+                    bt.logging.warning(f"KAV: DOB build failed for {storage_key!r}: {e}")
+                    dob_variants = []
+                dj = 0
+                while len(dob_variants) < target_count:
+                    dj += 1
+                    dob_variants.append((datetime(1990, 1, 15) + timedelta(days=dj * 37)).strftime("%Y-%m-%d"))
+                try:
+                    address_variants = self._build_address_variations(seed_address, target_count)
+                except Exception as e:
+                    bt.logging.warning(f"KAV address build failed for {storage_key!r}: {e}")
+                    self._increment_fail_reason(run_fail_reasons, "kav_address_build_exception")
+                    cn, cc, pc = self._resolve_region_target(seed_address)
+                    address_variants = [
+                        self._make_address_line(self._pick_city_for_country(cc, pc, j), cn, j + 3)
+                        for j in range(target_count)
+                    ]
 
-                structured = []
+                structured: List[List[str]] = []
                 for idx in range(target_count):
-                    structured.append([
-                        names[idx],
-                        dob_variants[idx] if idx < len(dob_variants) else (seed_dob or ""),
-                        address_variants[idx] if idx < len(address_variants) else (seed_address or ""),
-                    ])
+                    nm = names[idx] if idx < len(names) else storage_key
+                    if not str(nm).strip():
+                        nm = storage_key
+                    dob_v = dob_variants[idx] if idx < len(dob_variants) else (seed_dob or "")
+                    if not str(dob_v).strip():
+                        dob_v = (datetime(1990, 1, 15) + timedelta(days=idx * 17 + 1)).strftime("%Y-%m-%d")
+                    addr_v = address_variants[idx] if idx < len(address_variants) else (seed_address or "")
+                    if not str(addr_v).strip():
+                        cn, cc, pc = self._resolve_region_target(seed_address)
+                        addr_v = self._make_address_line(
+                            self._pick_city_for_country(cc, pc, idx + 1), cn, idx + 11
+                        )
+                    structured.append([str(nm).strip(), str(dob_v).strip(), str(addr_v).strip()])
 
-                name_variations[canonical_seed_name] = structured
+                name_variations[storage_key] = structured
+                kav_per_identity_stats[storage_key] = {
+                    "response_index": i,
+                    "llm_raw_candidates": len(raw_name_variations),
+                    "rows_built_pre_finalize": len(structured),
+                    "matched_seed_name": matched_seed_name,
+                }
                 bt.logging.info(
-                    f"Processed {len(structured)} structured variations for {canonical_seed_name} "
+                    f"Processed {len(structured)} structured variations for {storage_key} "
                     f"(DOB non-empty: {sum(1 for s in structured if len(s) > 1 and s[1].strip())}, "
                     f"Address non-empty: {sum(1 for s in structured if len(s) > 2 and s[2].strip())})"
                 )
             except Exception as e:
-                bt.logging.error(f"Error processing response {i}: {e}")
+                bt.logging.error(f"Error processing response {i}: {e}", exc_info=True)
                 self._increment_fail_reason(run_fail_reasons, "response_parse_error")
 
-        bt.logging.info(f"Generated structured variations for {len(name_variations)} seed names")
-        return name_variations
+        name_variations = self._kav_fill_missing_identities(
+            name_variations,
+            identity_list,
+            expected_count,
+            query_template,
+            run_fail_reasons=run_fail_reasons,
+        )
+
+        name_variations_final = self._finalize_kav_output_order(
+            name_variations,
+            identity_list,
+            expected_count,
+            query_template,
+            run_fail_reasons=run_fail_reasons,
+        )
+
+        debug_identities: List[Dict[str, Any]] = []
+        for identity in identity_list:
+            if not identity:
+                continue
+            seed_key = str(identity[0]).strip()
+            if not seed_key:
+                continue
+            rows = name_variations_final.get(seed_key, [])
+            id_row = identity_by_name.get(seed_key, ["", "", ""])
+            sd = str(id_row[1]).strip() if len(id_row) > 1 else ""
+            sa = str(id_row[2]).strip() if len(id_row) > 2 else ""
+            stats = kav_per_identity_stats.get(seed_key, {})
+            metrics = kav_helpers.debug_score_identity_output(seed_key, sd, sa, rows, expected_count)
+            debug_identities.append(
+                {
+                    "seed": seed_key,
+                    "target_count": expected_count,
+                    "row_count": len(rows),
+                    "metrics": metrics,
+                    "pre_stats": stats,
+                }
+            )
+
+        identities_requested = sum(1 for x in identity_list if x and str(x[0]).strip())
+        total_rows_requested = identities_requested * expected_count
+        total_rows_returned = sum(len(name_variations_final.get(str(x[0]).strip(), [])) for x in identity_list if x and str(x[0]).strip())
+        debug_payload = {
+            "run_id": run_id,
+            "expected_variation_count": expected_count,
+            "identities_requested": identities_requested,
+            "identities_returned": len(name_variations_final),
+            "total_rows_requested": total_rows_requested,
+            "total_rows_returned": total_rows_returned,
+            "avg_rows_per_identity": (total_rows_returned / max(identities_requested, 1)),
+            "fail_reasons_snapshot": dict(run_fail_reasons),
+            "per_identity": debug_identities,
+            "worst_by_missing": kav_helpers.debug_score_run(debug_identities).get("worst_by_missing", []),
+        }
+        try:
+            kav_helpers.write_kav_debug_json(os.path.join(run_dir, f"kav_debug_{run_id}.json"), debug_payload)
+            bt.logging.info(f"KAV debug summary written to {run_dir}/kav_debug_{run_id}.json")
+        except Exception as e:
+            bt.logging.warning(f"KAV debug JSON failed: {e}")
+
+        bt.logging.info(f"Generated structured variations for {len(name_variations_final)} seed names (ordered)")
+        return name_variations_final
 
     def save_variations_to_json(self, name_variations: Dict[str, List[str]], run_id: int, run_dir: str) -> None:
         """

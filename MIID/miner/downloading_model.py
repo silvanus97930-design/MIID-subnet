@@ -34,15 +34,26 @@ Parameters you can change for your machine:
       you switch to a different FLUX variant and update the pipeline class to match.
 """
 
+import os
+
 import torch
-from diffusers import Flux2Pipeline
+from diffusers import Flux2KleinPipeline
 
-device = "cpu"
-dtype = torch.float32
+MODEL_ID = os.environ.get("FLUX_MODEL_ID", "black-forest-labs/FLUX.2-klein-4B")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+dtype = torch.float32 if device == "cpu" else (torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
 
-pipe = Flux2Pipeline.from_pretrained(
-    "black-forest-labs/FLUX.2-klein-4B",
+token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or ""
+if not token.strip():
+    raise RuntimeError(
+        "Set HF_TOKEN or HUGGINGFACE_TOKEN (read token from huggingface.co/settings/tokens)."
+    )
+
+pipe = Flux2KleinPipeline.from_pretrained(
+    MODEL_ID,
     torch_dtype=dtype,
+    token=token,
 )
+pipe = pipe.to(device)
 
 print("Model downloaded and loaded successfully.")
