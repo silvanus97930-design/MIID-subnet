@@ -25,6 +25,40 @@ def _float_env(name: str, default: float) -> float:
         return float(default)
 
 
+def _env_token(value: str) -> str:
+    token = "".join(ch if ch.isalnum() else "_" for ch in str(value or "").strip().upper())
+    while "__" in token:
+        token = token.replace("__", "_")
+    return token.strip("_")
+
+
+def _min_final_score_threshold(compiled_type: str, compiled_intensity: str) -> float:
+    keys = []
+    type_tok = _env_token(compiled_type)
+    intensity_tok = _env_token(compiled_intensity)
+    legacy_type_tok = type_tok[:-5] if type_tok.endswith("_EDIT") else type_tok
+    if type_tok and intensity_tok:
+        keys.append(f"PHASE4_MIN_FINAL_SCORE_{type_tok}_{intensity_tok}")
+    if legacy_type_tok and legacy_type_tok != type_tok and intensity_tok:
+        keys.append(f"PHASE4_MIN_FINAL_SCORE_{legacy_type_tok}_{intensity_tok}")
+    if type_tok:
+        keys.append(f"PHASE4_MIN_FINAL_SCORE_{type_tok}")
+    if legacy_type_tok and legacy_type_tok != type_tok:
+        keys.append(f"PHASE4_MIN_FINAL_SCORE_{legacy_type_tok}")
+    keys.append("PHASE4_MIN_FINAL_SCORE_TO_SUBMIT")
+    keys.append("PHASE4_MIN_FINAL_SCORE")
+
+    for key in keys:
+        raw = os.environ.get(key)
+        if raw is None or str(raw).strip() == "":
+            continue
+        try:
+            return float(str(raw).strip())
+        except Exception:
+            continue
+    return 0.0
+
+
 def compute_image_sha256(image_bytes: bytes) -> str:
     return hashlib.sha256(image_bytes).hexdigest()
 
@@ -105,7 +139,7 @@ def verify_pre_upload(
             "expected_intensity": compiled_intensity,
         }
 
-    min_final = _float_env("PHASE4_MIN_FINAL_SCORE", 0.0)
+    min_final = _min_final_score_threshold(compiled_type, compiled_intensity)
     if min_final > 0.0:
         fs = extract_submission_final_score(variation)
         if fs is None:

@@ -136,7 +136,7 @@ def preprocess_seed_face(
         rgb, m.min_face_size, m.thresholds, m.nms_thresholds, m.factor
     )
 
-    if not boxes or len(boxes) == 0:
+    if boxes is None or len(boxes) == 0:
         return FacePreprocessResult(
             ok=False,
             face_count=0,

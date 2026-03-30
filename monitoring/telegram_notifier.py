@@ -596,6 +596,15 @@ class TelegramNotifier:
             lines.append(f"reveal_timestamp: {image_request.get('reveal_timestamp', 0)}")
             lines.append(f"base_image_base64_chars: {image_request.get('base_image_base64_chars', 0)}")
             lines.append(f"base_image_sha256: {image_request.get('base_image_sha256', '')}")
+            saved_seed = image_request.get("saved_seed_image")
+            if isinstance(saved_seed, dict):
+                lines.append(f"seed saved: {'yes' if saved_seed.get('saved') else 'no'}")
+                if saved_seed.get("saved_image_path"):
+                    lines.append(f"seed image path: {saved_seed.get('saved_image_path', '')}")
+                if saved_seed.get("metadata_path"):
+                    lines.append(f"seed metadata path: {saved_seed.get('metadata_path', '')}")
+                if saved_seed.get("error"):
+                    lines.append(f"seed save error: {saved_seed.get('error', '')}")
 
             variation_requests = image_request.get("variation_requests")
             if isinstance(variation_requests, list) and variation_requests:

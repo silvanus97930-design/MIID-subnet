@@ -12,12 +12,14 @@ import bittensor as bt
 from MIID.miner.generator_backends.base import GenerationConfig, ImageGeneratorBackend
 from MIID.miner.generator_backends.flux import FluxGeneratorBackend
 from MIID.miner.generator_backends.sdxl_img2img import SdxlImg2ImgGeneratorBackend
+from MIID.miner.generator_backends.zimage import ZImageGeneratorBackend
 
 __all__ = [
     "GenerationConfig",
     "ImageGeneratorBackend",
     "FluxGeneratorBackend",
     "SdxlImg2ImgGeneratorBackend",
+    "ZImageGeneratorBackend",
     "get_image_generator_backend",
     "resolve_image_generation_backend_name",
 ]
@@ -25,6 +27,7 @@ __all__ = [
 _BACKEND_REGISTRY: Dict[str, Type[ImageGeneratorBackend]] = {
     "flux": FluxGeneratorBackend,
     "sdxl_img2img": SdxlImg2ImgGeneratorBackend,
+    "zimage": ZImageGeneratorBackend,
 }
 
 _backend_singleton: ImageGeneratorBackend | None = None

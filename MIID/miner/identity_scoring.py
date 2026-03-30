@@ -151,7 +151,7 @@ def _primary_from_components(
     arc: ScorerComponentResult,
 ) -> Tuple[Optional[float], str]:
     mode = (os.environ.get("PHASE4_IDENTITY_PRIMARY", "adaface") or "adaface").strip().lower()
-    if mode == "insightface" or mode == "insightface_arcface":
+    if mode in {"arcface", "insightface", "insightface_arcface"}:
         if arc.available and arc.similarity is not None:
             return arc.similarity, "insightface_arcface"
         if ada.available and ada.similarity is not None:

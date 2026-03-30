@@ -22,6 +22,12 @@ from MIID.miner.face_preprocess import FacePreprocessResult, preprocess_seed_fac
 from MIID.miner.adherence import VariationAdherenceContext
 from MIID.miner.generator_backends import GenerationConfig, get_image_generator_backend
 from MIID.miner.identity_scoring import IdentityScoreResult, IdentityScoringService
+from MIID.miner.layered_edit import (
+    layered_background_enabled,
+    layered_screen_replay_enabled,
+    prepare_screen_replay_subject,
+    preserve_subject_over_candidate,
+)
 from MIID.miner.pipeline_observability import log_phase4_json
 from MIID.miner.reranker import (
     build_candidate_scores,
@@ -29,7 +35,11 @@ from MIID.miner.reranker import (
     load_rerank_config_from_env,
     select_best_candidate_index,
 )
-from MIID.miner.screen_replay import build_raw_results_screen_replay, screen_replay_pipeline_enabled
+from MIID.miner.screen_replay import (
+    build_raw_results_screen_replay,
+    extract_identity_focus_crop,
+    screen_replay_pipeline_enabled,
+)
 
 
 def decode_base_image(base64_image: str) -> Image.Image:
@@ -77,6 +87,8 @@ def _face_preprocess_summary(prep: FacePreprocessResult) -> Dict[str, Any]:
 
 
 def _primary_identity_score(r: IdentityScoreResult) -> Optional[float]:
+    if r.primary_similarity is not None:
+        return r.primary_similarity
     s = r.adaface.similarity if r.adaface.available else None
     if s is None and r.insightface_arcface.available:
         s = r.insightface_arcface.similarity
@@ -87,6 +99,51 @@ def _req_type(req: Any) -> str:
     return str(
         getattr(req, "type", None) or (req.get("type") if isinstance(req, dict) else None) or ""
     ).strip()
+
+
+def _identity_scoring_candidates(item: Dict[str, Any], candidates: List[Image.Image]) -> List[Image.Image]:
+    if item.get("pipeline") != "screen_replay_dedicated":
+        return candidates
+
+    metas = item.get("screen_replay_candidate_metas")
+    if not isinstance(metas, list) or len(metas) != len(candidates):
+        return candidates
+
+    return [
+        extract_identity_focus_crop(candidate, meta)
+        for candidate, meta in zip(candidates, metas)
+    ]
+
+
+def _repair_screen_replay_identity_results(
+    item: Dict[str, Any],
+    candidates: List[Image.Image],
+    identity_service: IdentityScoringService,
+    results: List[IdentityScoreResult],
+) -> List[IdentityScoreResult]:
+    if item.get("pipeline") != "screen_replay_dedicated":
+        return results
+
+    repaired = list(results)
+    recovered = 0
+    for idx, res in enumerate(repaired):
+        if _primary_identity_score(res) is not None:
+            continue
+        try:
+            alt = identity_service.score_candidate(candidates[idx].convert("RGB"))
+        except Exception:
+            continue
+        if _primary_identity_score(alt) is not None:
+            repaired[idx] = alt
+            recovered += 1
+
+    if recovered:
+        bt.logging.info(
+            "Phase4 screen_replay identity fallback recovered %d/%d null crop scores",
+            recovered,
+            len(candidates),
+        )
+    return repaired
 
 
 def generate_variations(
@@ -157,6 +214,39 @@ def generate_variations(
             )
             guidance_scale_override = _float_env("FLUX_GUIDANCE_SCALE_POSE_FAR", 3.0)
 
+        if req_type == "expression_edit" and req_intensity == "far":
+            # Strong expression edits need extra search budget; otherwise reranking
+            # often settles for high-adherence / low-identity outliers.
+            expr_min = _int_env("PHASE4_EXPRESSION_FAR_CANDIDATES_PER_REQUEST_MIN", 4)
+            expr_max = _int_env("PHASE4_EXPRESSION_FAR_MAX_CANDIDATES_PER_REQUEST", 8)
+            candidates_per_request = min(max(candidates_per_request, expr_min), expr_max)
+
+            num_inference_steps_override = _int_env(
+                "FLUX_NUM_INFERENCE_STEPS_EXPRESSION_FAR",
+                _int_env("FLUX_NUM_INFERENCE_STEPS", 20) + 4,
+            )
+            guidance_scale_override = _float_env("FLUX_GUIDANCE_SCALE_EXPRESSION_FAR", 3.1)
+
+        if req_type == "background_edit" and req_intensity in {"light", "medium"}:
+            bg_min = _int_env(
+                f"PHASE4_BACKGROUND_{req_intensity.upper()}_CANDIDATES_PER_REQUEST_MIN",
+                4,
+            )
+            bg_max = _int_env(
+                f"PHASE4_BACKGROUND_{req_intensity.upper()}_CANDIDATES_PER_REQUEST_MAX",
+                6,
+            )
+            candidates_per_request = min(max(candidates_per_request, bg_min), bg_max)
+
+            num_inference_steps_override = _int_env(
+                f"FLUX_NUM_INFERENCE_STEPS_BACKGROUND_{req_intensity.upper()}",
+                _int_env("FLUX_NUM_INFERENCE_STEPS", 20) + 2,
+            )
+            guidance_scale_override = _float_env(
+                f"FLUX_GUIDANCE_SCALE_BACKGROUND_{req_intensity.upper()}",
+                2.9,
+            )
+
         if req_type == "lighting_edit" and req_intensity == "medium":
             # Lighting changes can significantly shift embedding similarity; we
             # broaden candidate sampling and spend a few extra inference steps.
@@ -168,7 +258,7 @@ def generate_variations(
                 "FLUX_NUM_INFERENCE_STEPS_LIGHTING_MEDIUM",
                 _int_env("FLUX_NUM_INFERENCE_STEPS", 20) + 3,
             )
-            guidance_scale_override = _float_env("FLUX_GUIDANCE_SCALE_LIGHTING_MEDIUM", 3.5)
+            guidance_scale_override = _float_env("FLUX_GUIDANCE_SCALE_LIGHTING_MEDIUM", 3.0)
 
         if req_type == "screen_replay" and req_intensity == "standard":
             # Screen-capture is harder for identity embeddings due to display optics
@@ -192,6 +282,7 @@ def generate_variations(
         and len(variation_requests) == 1
         and _req_type(variation_requests[0]) == "screen_replay"
     )
+    screen_replay_layered_meta: Optional[Dict[str, Any]] = None
     face_prep: FacePreprocessResult
     if use_sr_dedicated:
         t_face0 = time.perf_counter()
@@ -199,12 +290,21 @@ def generate_variations(
         face_preprocess_ms = (time.perf_counter() - t_face0) * 1000.0
         if face_prep.warnings:
             bt.logging.debug(f"Phase 4 face preprocess: {'; '.join(face_prep.warnings)}")
+        sr_source = face_prep.aligned_face if face_prep.ok else None
+        if layered_screen_replay_enabled():
+            try:
+                sr_source, screen_replay_layered_meta = prepare_screen_replay_subject(
+                    base_image,
+                    face_prep.face_box_xyxy if face_prep.ok else None,
+                )
+            except Exception as e:
+                bt.logging.warning(f"Phase 4 layered screen_replay helper failed: {e}")
         raw_results = build_raw_results_screen_replay(
             base_image,
             variation_requests[0],
             candidates_per_request,
             generation_timings,
-            aligned_face=face_prep.aligned_face if face_prep.ok else None,
+            aligned_face=sr_source,
         )
         if not raw_results:
             bt.logging.warning(
@@ -252,13 +352,37 @@ def generate_variations(
         description = str(item.get("description") or "")
         detail = str(item.get("detail") or "")
         candidates = list(item.get("candidates", []) or [])
+        layered_adjustments: List[Dict[str, Any]] = []
 
         if not candidates:
             bt.logging.warning(f"No candidates generated for {var_type}({intensity})")
             continue
 
+        if var_type == "background_edit" and layered_background_enabled():
+            patched_candidates: List[Image.Image] = []
+            for cand in candidates:
+                try:
+                    patched, meta = preserve_subject_over_candidate(
+                        base_image,
+                        cand,
+                        face_prep.face_box_xyxy if face_prep.ok else None,
+                    )
+                    patched_candidates.append(patched)
+                    layered_adjustments.append(meta)
+                except Exception as e:
+                    patched_candidates.append(cand)
+                    layered_adjustments.append({"layered_subject_used": False, "error": str(e)})
+            candidates = patched_candidates
+
         tr0 = time.perf_counter()
-        id_results_struct = identity_service.score_candidates(candidates)
+        identity_candidates = _identity_scoring_candidates(item, candidates)
+        id_results_struct = identity_service.score_candidates(identity_candidates)
+        id_results_struct = _repair_screen_replay_identity_results(
+            item,
+            candidates,
+            identity_service,
+            id_results_struct,
+        )
         scores = [_primary_identity_score(r) for r in id_results_struct]
 
         sd = item.get("screen_replay_device")
@@ -324,6 +448,8 @@ def generate_variations(
                 "identity_scores": identity_scores_payload,
                 "identity_score_selected": best_identity,
                 "face_preprocess": _face_preprocess_summary(face_prep),
+                "layered_adjustments": layered_adjustments,
+                "screen_replay_layered_helper": screen_replay_layered_meta,
             }
         )
         variation_packaging_ms += (time.perf_counter() - tp0) * 1000.0

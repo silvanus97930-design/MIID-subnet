@@ -206,10 +206,17 @@ class Miner(BaseMinerNeuron):
         if hotkey in self.WHITELISTED_VALIDATORS:
             return True
 
-        try:
-            uid = self.metagraph.hotkeys.index(hotkey)
-        except ValueError:
-            return False
+        uid = self._get_validator_uid(hotkey)
+        if uid is None:
+            # A validator permit can change while the miner is already running.
+            # Refresh once on an unknown hotkey before rejecting the request.
+            try:
+                self.resync_metagraph()
+            except Exception as e:
+                bt.logging.debug(f"Metagraph refresh on unknown hotkey failed: {e}")
+            uid = self._get_validator_uid(hotkey)
+            if uid is None:
+                return False
 
         try:
             has_permit = bool(self.metagraph.validator_permit[uid])
@@ -224,6 +231,12 @@ class Miner(BaseMinerNeuron):
             return True
 
         return False
+
+    def _get_validator_uid(self, hotkey: str) -> Optional[int]:
+        try:
+            return self.metagraph.hotkeys.index(hotkey)
+        except ValueError:
+            return None
 
     def _initialize_geodata(self) -> None:
         """Build country/city indexes used for reward-aligned address generation."""
@@ -1990,6 +2003,150 @@ class Miner(BaseMinerNeuron):
             "requested_variations": len(variation_requests),
         }
 
+    def _should_save_seed_images(self) -> bool:
+        value = os.environ.get("PHASE4_SAVE_VALIDATOR_SEED_IMAGES", "true").strip().lower()
+        return value in {"1", "true", "yes", "on"}
+
+    def _seed_image_save_dir(self) -> str:
+        configured = (os.environ.get("PHASE4_VALIDATOR_SEED_IMAGE_DIR") or "").strip()
+        if configured:
+            return configured
+        run_dir = (os.environ.get("RUN_DIR") or self.output_path or os.getcwd()).strip()
+        return os.path.join(run_dir, "validator_seed_images")
+
+    def _save_validator_seed_image(
+        self,
+        *,
+        run_id: int,
+        image_request: Any,
+        validator_name: str,
+        validator_hotkey: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not self._should_save_seed_images() or not image_request:
+            return None
+
+        base64_image = str(getattr(image_request, "base_image", "") or "")
+        if not base64_image:
+            return {"saved": False, "error": "missing_base_image"}
+
+        try:
+            out_dir = self._seed_image_save_dir()
+            os.makedirs(out_dir, exist_ok=True)
+
+            seed_image = decode_base_image(base64_image)
+            image_filename = str(getattr(image_request, "image_filename", "") or "seed_image")
+            stem = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.splitext(image_filename)[0]).strip("_") or "seed_image"
+            challenge = re.sub(
+                r"[^A-Za-z0-9._-]+",
+                "_",
+                str(getattr(image_request, "challenge_id", "") or ""),
+            ).strip("_")
+            validator_tag = re.sub(r"[^A-Za-z0-9._-]+", "_", validator_name).strip("_") or "validator"
+            suffix_parts = [f"run{int(run_id)}", validator_tag]
+            if challenge:
+                suffix_parts.append(challenge[:48])
+            basename = "__".join([stem] + suffix_parts)
+
+            image_path = os.path.join(out_dir, f"{basename}.png")
+            meta_path = os.path.join(out_dir, f"{basename}.json")
+            seed_image.save(image_path, format="PNG")
+
+            with open(image_path, "rb") as f:
+                image_sha256 = hashlib.sha256(f.read()).hexdigest()
+
+            meta = {
+                "saved": True,
+                "run_id": int(run_id),
+                "validator_name": str(validator_name or ""),
+                "validator_hotkey": str(validator_hotkey or ""),
+                "challenge_id": str(getattr(image_request, "challenge_id", "") or ""),
+                "image_filename": image_filename,
+                "saved_image_path": image_path,
+                "width": int(seed_image.size[0]),
+                "height": int(seed_image.size[1]),
+                "png_sha256": image_sha256,
+                "base_image_sha256": hashlib.sha256(base64_image.encode("utf-8")).hexdigest(),
+                "saved_at_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+
+            meta["metadata_path"] = meta_path
+            bt.logging.info(f"Saved validator seed image to {image_path}")
+            return meta
+        except Exception as e:
+            bt.logging.warning(f"Failed to save validator seed image: {e}")
+            return {"saved": False, "error": str(e)}
+
+    def _should_save_dashboard_preview_images(self) -> bool:
+        value = os.environ.get("PHASE4_DASHBOARD_SAVE_PREVIEW_IMAGES", "true").strip().lower()
+        return value in {"1", "true", "yes", "on"}
+
+    def _dashboard_preview_dir(self) -> str:
+        configured = (os.environ.get("PHASE4_DASHBOARD_PREVIEW_DIR") or "").strip()
+        if configured:
+            return configured
+        run_dir = (os.environ.get("RUN_DIR") or self.output_path or os.getcwd()).strip()
+        return os.path.join(run_dir, "dashboard_preview_images")
+
+    def _save_dashboard_variation_preview(
+        self,
+        *,
+        run_id: int,
+        challenge_id: str,
+        req_index: int,
+        label: str,
+        attempt: int,
+        selected_image: Any,
+        primary_score: float,
+        final_score: Optional[float],
+        candidate_count: int,
+        selected_candidate_index: int,
+        image_hash: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not self._should_save_dashboard_preview_images():
+            return None
+        if not isinstance(selected_image, Image.Image):
+            return None
+
+        try:
+            out_dir = self._dashboard_preview_dir()
+            os.makedirs(out_dir, exist_ok=True)
+            safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", label).strip("_") or "variation"
+            safe_challenge = re.sub(r"[^A-Za-z0-9._-]+", "_", str(challenge_id or "")).strip("_")
+            basename_parts = [f"run{int(run_id)}"]
+            if safe_challenge:
+                basename_parts.append(safe_challenge[:48])
+            basename_parts.append(f"req{int(req_index):02d}")
+            basename_parts.append(safe_label)
+            basename_parts.append(f"attempt{int(attempt)}")
+            basename = "__".join(basename_parts)
+
+            image_path = os.path.join(out_dir, f"{basename}.png")
+            meta_path = os.path.join(out_dir, f"{basename}.json")
+            selected_image.save(image_path, format="PNG")
+            meta = {
+                "run_id": int(run_id),
+                "challenge_id": str(challenge_id or ""),
+                "request_index": int(req_index),
+                "label": str(label or ""),
+                "attempt": int(attempt),
+                "primary_score": float(primary_score),
+                "final_score": float(final_score) if final_score is not None else None,
+                "candidate_count": int(candidate_count),
+                "selected_candidate_index": int(selected_candidate_index),
+                "image_hash": str(image_hash or ""),
+                "image_path": image_path,
+                "saved_at_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+            meta["metadata_path"] = meta_path
+            return meta
+        except Exception as e:
+            bt.logging.warning(f"Failed to save dashboard preview image: {e}")
+            return None
+
     def _emit_validator_request_event(
         self,
         run_id: int,
@@ -2000,6 +2157,16 @@ class Miner(BaseMinerNeuron):
         dendrite = getattr(synapse, "dendrite", None)
         validator_hotkey = str(getattr(dendrite, "hotkey", "") or "")
         validator_name = self.WHITELISTED_VALIDATORS.get(validator_hotkey, "UnknownValidator")
+        image_request = getattr(synapse, "image_request", None)
+        image_request_summary = self._summarize_image_request(image_request)
+        seed_capture = self._save_validator_seed_image(
+            run_id=run_id,
+            image_request=image_request,
+            validator_name=validator_name,
+            validator_hotkey=validator_hotkey,
+        )
+        if isinstance(image_request_summary, dict) and isinstance(seed_capture, dict):
+            image_request_summary["saved_seed_image"] = seed_capture
 
         payload = {
             "run_id": int(run_id),
@@ -2012,7 +2179,7 @@ class Miner(BaseMinerNeuron):
             "body_hash": str(getattr(synapse, "computed_body_hash", "") or ""),
             "query_template": str(getattr(synapse, "query_template", "") or ""),
             "identity": self._summarize_identity_payload(list(getattr(synapse, "identity", []) or [])),
-            "image_request": self._summarize_image_request(getattr(synapse, "image_request", None)),
+            "image_request": image_request_summary,
         }
         self._emit_telegram_event("validator_request", payload)
 
@@ -2147,6 +2314,10 @@ class Miner(BaseMinerNeuron):
                 "Phase 4 timelock unavailable. Encrypted submissions are disabled "
                 "until timelock_wasm_wrapper is installed."
             )
+
+    def resync_metagraph(self):
+        super().resync_metagraph()
+        self._sync_dynamic_validator_whitelist()
 
     def _unload_ollama_model(self) -> None:
         """Release Ollama model from GPU memory before Phase 4 image generation."""
@@ -2489,6 +2660,51 @@ class Miner(BaseMinerNeuron):
                 except Exception:
                     return int(default)
 
+            def _env_float(name: str, default: float) -> float:
+                raw = os.environ.get(name)
+                if raw is None:
+                    return float(default)
+                try:
+                    return float(str(raw).strip() or str(default))
+                except Exception:
+                    return float(default)
+
+            def _env_token(value: str) -> str:
+                token = "".join(ch if ch.isalnum() else "_" for ch in str(value or "").strip().upper())
+                while "__" in token:
+                    token = token.replace("__", "_")
+                return token.strip("_")
+
+            def _identity_threshold_for_variation(variation_type: str, variation_intensity: str) -> float:
+                fallback = {
+                    ("pose_edit", "far"): 0.66,
+                    ("lighting_edit", "medium"): 0.62,
+                    ("screen_replay", "standard"): 0.68,
+                }.get((variation_type, variation_intensity), 0.70)
+                type_tok = _env_token(variation_type)
+                intensity_tok = _env_token(variation_intensity)
+                keys = []
+                legacy_type_tok = type_tok[:-5] if type_tok.endswith("_EDIT") else type_tok
+                if type_tok and intensity_tok:
+                    keys.append(f"PHASE4_MIN_IDENTITY_SIMILARITY_{type_tok}_{intensity_tok}")
+                if legacy_type_tok and legacy_type_tok != type_tok and intensity_tok:
+                    keys.append(f"PHASE4_MIN_IDENTITY_SIMILARITY_{legacy_type_tok}_{intensity_tok}")
+                if type_tok:
+                    keys.append(f"PHASE4_MIN_IDENTITY_SIMILARITY_{type_tok}")
+                if legacy_type_tok and legacy_type_tok != type_tok:
+                    keys.append(f"PHASE4_MIN_IDENTITY_SIMILARITY_{legacy_type_tok}")
+                keys.append("PHASE4_MIN_IDENTITY_SIMILARITY")
+
+                for key in keys:
+                    raw = os.environ.get(key)
+                    if raw is None or str(raw).strip() == "":
+                        continue
+                    try:
+                        return float(str(raw).strip())
+                    except Exception:
+                        continue
+                return float(fallback)
+
             base_candidates = max(1, _env_int("PHASE4_CANDIDATES_PER_REQUEST", _env_int("FLUX_CANDIDATES_PER_REQUEST", 4)))
             candidate_retry_boost = max(0, _env_int("PHASE4_RETRY_CANDIDATE_BOOST", 2))
             max_retry_candidates = max(base_candidates, _env_int("PHASE4_MAX_CANDIDATES_PER_REQUEST", 10))
@@ -2538,10 +2754,10 @@ class Miner(BaseMinerNeuron):
                 label = compiled.label()
                 success = False
                 last_reason = "phase4_unknown_failure"
-                # Identity preservation gets harder for near-profile ("far") pose edits.
-                # Calibrate the gate so we submit candidates that are very likely to pass
-                # validator-side identity checks, while still rejecting obvious failures.
-                identity_threshold = float(os.environ.get("PHASE4_MIN_IDENTITY_SIMILARITY", "0.7"))
+                identity_threshold = _identity_threshold_for_variation(
+                    base_variation_type,
+                    intensity.lower(),
+                )
 
                 # Candidate search expansion for far pose edits.
                 req_base_candidates = base_candidates
@@ -2549,10 +2765,6 @@ class Miner(BaseMinerNeuron):
                 req_max_retry_candidates = max_retry_candidates
 
                 if base_variation_type == "pose_edit" and intensity.lower() == "far":
-                    identity_threshold = float(
-                        os.environ.get("PHASE4_MIN_IDENTITY_SIMILARITY_POSE_FAR", "0.66")
-                    )
-
                     # Allow broader candidate sampling for far pose edits.
                     pose_far_min = _env_int("PHASE4_POSE_FAR_CANDIDATES_PER_REQUEST_MIN", req_base_candidates)
                     pose_far_max = _env_int("PHASE4_POSE_FAR_MAX_CANDIDATES_PER_REQUEST", req_max_retry_candidates)
@@ -2562,26 +2774,6 @@ class Miner(BaseMinerNeuron):
                     req_base_candidates = min(max(req_base_candidates, pose_far_min), pose_far_hard_cap)
                     req_max_retry_candidates = min(max(req_max_retry_candidates, pose_far_max), pose_far_hard_cap)
                     req_candidate_retry_boost = max(req_candidate_retry_boost, pose_far_boost)
-
-                if base_variation_type == "lighting_edit" and intensity.lower() == "medium":
-                    # Calibrate identity gate for lighting changes; embeddings can
-                    # drop even when the identity is visually preserved.
-                    identity_threshold = float(
-                        os.environ.get(
-                            "PHASE4_MIN_IDENTITY_SIMILARITY_LIGHTING_MEDIUM",
-                            "0.62",
-                        )
-                    )
-
-                if base_variation_type == "screen_replay" and intensity.lower() == "standard":
-                    # Screen replay captures include display optics (glare, moire),
-                    # which can shift embeddings without necessarily changing identity.
-                    identity_threshold = float(
-                        os.environ.get(
-                            "PHASE4_MIN_IDENTITY_SIMILARITY_SCREEN_REPLAY_STANDARD",
-                            "0.68",
-                        )
-                    )
 
                 for attempt in range(1, max_attempts + 1):
                     try:
@@ -2634,9 +2826,43 @@ class Miner(BaseMinerNeuron):
                                 similarity = 0.0
                         candidate_count = int(var.get("candidate_count", 1) or 1)
                         selected_idx = int(var.get("selected_candidate_index", 0) or 0)
+                        selected_image = var.get("image")
+                        preview_final_score = extract_submission_final_score(var)
+                        preview_meta = self._save_dashboard_variation_preview(
+                            run_id=run_id,
+                            challenge_id=challenge_id,
+                            req_index=req_index,
+                            label=label,
+                            attempt=attempt,
+                            selected_image=selected_image,
+                            primary_score=similarity,
+                            final_score=preview_final_score,
+                            candidate_count=candidate_count,
+                            selected_candidate_index=selected_idx,
+                            image_hash=str(var.get("image_hash", "") or ""),
+                        )
+                        if isinstance(preview_meta, dict) and preview_meta.get("image_path"):
+                            self._emit_telegram_event(
+                                "phase4_variation_preview",
+                                {
+                                    "run_id": int(run_id),
+                                    "challenge_id": str(challenge_id or ""),
+                                    "request_index": int(req_index),
+                                    "label": str(label or ""),
+                                    "attempt": int(attempt),
+                                    "primary_score": float(similarity),
+                                    "final_score": float(preview_final_score)
+                                    if preview_final_score is not None
+                                    else None,
+                                    "candidate_count": int(candidate_count),
+                                    "selected_candidate_index": int(selected_idx),
+                                    "image_hash": str(var.get("image_hash", "") or ""),
+                                    "image_path": str(preview_meta.get("image_path") or ""),
+                                    "metadata_path": str(preview_meta.get("metadata_path") or ""),
+                                },
+                            )
 
                         if debug_save_images:
-                            selected_image = var.get("image")
                             if isinstance(selected_image, Image.Image):
                                 safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", label).strip("_") or "variation"
                                 score_tag = f"{similarity:.4f}"

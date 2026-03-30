@@ -286,14 +286,22 @@ def _default_background_metrics(base: Image.Image, cand: Image.Image) -> Dict[st
     b = _resize_gray(base, 64)
     c = _resize_gray(cand, 64)
     h, w = b.shape
-    c0, c1 = int(0.25 * h), int(0.75 * h)
-    r0, r1 = int(0.25 * w), int(0.75 * w)
-    center_mse = float(np.mean((c[c0:c1, r0:r1] - b[c0:c1, r0:r1]) ** 2))
+    c0, c1 = int(0.18 * h), int(0.82 * h)
+    r0, r1 = int(0.32 * w), int(0.68 * w)
+    center_b = b[c0:c1, r0:r1]
+    center_c = c[c0:c1, r0:r1]
+    center_mse = float(np.mean((center_c - center_b) ** 2))
+    center_structure = _high_pass_correlation(center_b, center_c)
     # border change: candidate border vs base border
     bc = np.concatenate([c[0:4, :].flatten(), c[-4:, :].flatten(), c[:, 0:4].flatten(), c[:, -4:].flatten()])
     bb = np.concatenate([b[0:4, :].flatten(), b[-4:, :].flatten(), b[:, 0:4].flatten(), b[:, -4:].flatten()])
     border_mse = float(np.mean((bc - bb) ** 2))
-    return {"center_mse": center_mse, "border_mse": border_mse, "border_to_center_ratio": border_mse / (center_mse + 1e-6)}
+    return {
+        "center_mse": center_mse,
+        "center_structure": center_structure,
+        "border_mse": border_mse,
+        "border_to_center_ratio": border_mse / (center_mse + 1e-6),
+    }
 
 
 def _background_targets(intensity: str) -> Tuple[float, float]:
@@ -316,17 +324,25 @@ def validate_background_edit(
     max_center, min_ratio = _background_targets(ctx.intensity)
     ce = m.get("center_mse", 0.0)
     ratio = m.get("border_to_center_ratio", 0.0)
-    subject_s = 1.0 - min(1.0, float(ce) / max(max_center, 1e-6))
-    bg_s = _band_score(float(ratio), min_ratio * 0.65, min_ratio * 2.0)
-    score = float(np.clip(0.55 * subject_s + 0.45 * bg_s, 0.0, 1.0))
+    structure_s = float(m.get("center_structure", 0.5))
+    subject_s = 1.0 - min(1.0, float(ce) / max(max_center * 1.85, 1e-6))
+    bg_s = _band_score(float(ratio), min_ratio * 0.55, min_ratio * 2.4)
+    score = float(np.clip(0.32 * subject_s + 0.23 * structure_s + 0.45 * bg_s, 0.0, 1.0))
     ev = {
         "family": "background_edit",
         "intensity": ctx.intensity,
-        "validator": "background_edit_heuristic_v1",
+        "validator": "background_edit_heuristic_v2",
         "metrics": {k: round(float(v), 6) for k, v in m.items()},
-        "subscores": {"subject_preserved": subject_s, "background_changed": bg_s},
+        "subscores": {
+            "subject_preserved": subject_s,
+            "subject_structure_preserved": structure_s,
+            "background_changed": bg_s,
+        },
         "targets": {"max_center_mse": max_center, "min_border_center_ratio": min_ratio},
-        "notes": ["Low center MSE implies subject stable; high border delta implies background edit"],
+        "notes": [
+            "Center window is narrowed around the face region to avoid counting large background swaps as subject drift",
+            "High center structure plus strong border change indicates a better subject-preserving background edit",
+        ],
     }
     return AdherenceResult(score, ev, score >= _pass_threshold())
 

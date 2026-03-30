@@ -59,3 +59,9 @@ TELEGRAM_PID_FILE="${TELEGRAM_PID_FILE:-${RUN_DIR}/sn54-telegram.pid}"
 TELEGRAM_STATE_FILE="${TELEGRAM_STATE_FILE:-${RUN_DIR}/sn54-telegram.state.json}"
 
 mkdir -p "${LOG_DIR}" "${RUN_DIR}"
+if [[ -n "${PHASE4_VALIDATOR_SEED_IMAGE_DIR:-}" ]]; then
+  mkdir -p "${PHASE4_VALIDATOR_SEED_IMAGE_DIR}"
+fi
+if [[ -n "${PHASE4_DASHBOARD_PREVIEW_DIR:-}" ]]; then
+  mkdir -p "${PHASE4_DASHBOARD_PREVIEW_DIR}"
+fi

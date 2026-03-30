@@ -187,20 +187,51 @@ def stage_a_prepare_face(
     inner_size: Tuple[int, int],
     aligned_face: Optional[Image.Image] = None,
 ) -> Tuple[Image.Image, Dict[str, Any]]:
-    """Scale/crop identity content to fill inner screen without generative drift."""
+    """Prepare identity content for the device screen without destructive aspect-ratio crops."""
     src = aligned_face.convert("RGB") if aligned_face is not None else base_rgb.convert("RGB")
     iw, ih = inner_size
     sw, sh = src.size
-    scale = max(iw / sw, ih / sh)
-    nw, nh = max(1, int(sw * scale)), max(1, int(sh * scale))
-    resized = src.resize((nw, nh), Image.Resampling.LANCZOS)
-    left = max(0, (nw - iw) // 2)
-    top = max(0, (nh - ih) // 2)
-    crop = resized.crop((left, top, left + iw, top + ih))
+    src_ar = sw / max(sh, 1)
+    inner_ar = iw / max(ih, 1)
+    mismatch = max(src_ar / max(inner_ar, 1e-6), inner_ar / max(src_ar, 1e-6))
+    contain_threshold = float(np.clip(_float_env("SN54_SR_STAGEA_CONTAIN_ASPECT_THRESHOLD", 1.22), 1.0, 2.5))
+
+    if mismatch >= contain_threshold:
+        bg_scale = max(iw / sw, ih / sh)
+        bg_w, bg_h = max(1, int(sw * bg_scale)), max(1, int(sh * bg_scale))
+        bg = src.resize((bg_w, bg_h), Image.Resampling.LANCZOS)
+        bg_left = max(0, (bg_w - iw) // 2)
+        bg_top = max(0, (bg_h - ih) // 2)
+        canvas = bg.crop((bg_left, bg_top, bg_left + iw, bg_top + ih)).filter(
+            ImageFilter.GaussianBlur(radius=max(3.0, min(iw, ih) * 0.012))
+        )
+
+        fit_scale = min(iw / sw, ih / sh)
+        fit_w, fit_h = max(1, int(sw * fit_scale)), max(1, int(sh * fit_scale))
+        fitted = src.resize((fit_w, fit_h), Image.Resampling.LANCZOS)
+        paste_x = max(0, (iw - fit_w) // 2)
+        paste_y = max(0, (ih - fit_h) // 2)
+        canvas.paste(fitted, (paste_x, paste_y))
+        crop = canvas
+        layout = "contain_on_blurred_fill"
+        fitted_rect = [paste_x, paste_y, paste_x + fit_w, paste_y + fit_h]
+    else:
+        scale = max(iw / sw, ih / sh)
+        nw, nh = max(1, int(sw * scale)), max(1, int(sh * scale))
+        resized = src.resize((nw, nh), Image.Resampling.LANCZOS)
+        left = max(0, (nw - iw) // 2)
+        top = max(0, (nh - ih) // 2)
+        crop = resized.crop((left, top, left + iw, top + ih))
+        layout = "cover_crop"
+        fitted_rect = [0, 0, iw, ih]
+
     meta = {
         "stage": "A",
         "source": "aligned_face" if aligned_face is not None else "base_image",
         "inner_size": [iw, ih],
+        "layout": layout,
+        "aspect_mismatch": round(float(mismatch), 4),
+        "fitted_rect": fitted_rect,
     }
     return crop, meta
 
@@ -239,31 +270,43 @@ def _apply_glare(
     out = arr.copy()
     h, w, _ = out.shape
     gx, gy = np.mgrid[0:h, 0:w].astype(np.float32)
+    span_x = max(1, x1 - x0)
+    span_y = max(1, y1 - y0)
+    edge_band_x = max(10, int(span_x * 0.18))
+    edge_band_y = max(10, int(span_y * 0.18))
     for _ in range(int(rng.integers(1, 4))):
-        lo_x, hi_x = x0 + 8, x1 - 8
-        lo_y, hi_y = y0 + 8, y1 - 8
+        near_left = bool(rng.integers(0, 2))
+        near_top = bool(rng.integers(0, 2))
+        if near_left:
+            lo_x, hi_x = x0 + 4, min(x1 - 4, x0 + edge_band_x)
+        else:
+            lo_x, hi_x = max(x0 + 4, x1 - edge_band_x), x1 - 4
+        if near_top:
+            lo_y, hi_y = y0 + 4, min(y1 - 4, y0 + edge_band_y)
+        else:
+            lo_y, hi_y = max(y0 + 4, y1 - edge_band_y), y1 - 4
         if hi_x <= lo_x:
             lo_x, hi_x = x0, max(x0 + 1, x1 - 1)
         if hi_y <= lo_y:
             lo_y, hi_y = y0, max(y0 + 1, y1 - 1)
         cx = int(rng.integers(lo_x, hi_x + 1))
         cy = int(rng.integers(lo_y, hi_y + 1))
-        sigma = float(rng.uniform(max(12.0, (x1 - x0) * 0.06), max(20.0, (x1 - x0) * 0.14)))
+        sigma = float(rng.uniform(max(10.0, span_x * 0.04), max(18.0, span_x * 0.10)))
         d = np.sqrt((gx - cy) ** 2 + (gy - cx) ** 2)
         blob = np.exp(-(d**2) / (2 * sigma * sigma + 1e-6))[..., None]
-        spot = float(strengths.glare) * float(rng.uniform(0.45, 1.0))
-        out = np.clip(out + spot * blob * 0.5, 0.0, 1.0)
+        spot = float(strengths.glare) * float(rng.uniform(0.55, 1.05))
+        out = np.clip(out + spot * blob * 0.65, 0.0, 1.0)
     return out
 
 
 def _apply_edge_vignette(arr: np.ndarray, strengths: ScreenReplayCueStrengths, rng: np.random.Generator) -> np.ndarray:
     h, w, _ = arr.shape
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    nx = (xx - w * 0.5) / (w * 0.5 + 1e-6)
-    ny = (yy - h * 0.5) / (h * 0.5 + 1e-6)
-    r = np.sqrt(nx**2 + ny**2)
     v = float(strengths.edge_vignette) * float(rng.uniform(0.85, 1.15))
-    mask = np.clip(1.0 - v * (r**1.8), 0.35, 1.0)[..., None]
+    dist_edge = np.minimum.reduce([xx, yy, (w - 1) - xx, (h - 1) - yy])
+    band = max(4.0, min(h, w) * float(np.clip(_float_env("SN54_SR_EDGE_BAND_FRAC", 0.14), 0.05, 0.3)))
+    edge_strength = np.clip((band - dist_edge) / max(band, 1e-6), 0.0, 1.0)
+    mask = np.clip(1.0 - v * (edge_strength**1.6), 0.45, 1.0)[..., None]
     return np.clip(arr * mask, 0.0, 1.0)
 
 
@@ -278,7 +321,7 @@ def _apply_keystone_pil(img: Image.Image, strengths: ScreenReplayCueStrengths, r
     src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
     jx = rng.uniform(-1, 1, size=4) * dx
     jy = rng.uniform(-1, 1, size=4) * dy
-    dst = src + np.stack([jx, jy], axis=1)
+    dst = np.float32(src + np.stack([jx, jy], axis=1))
     M = cv2.getPerspectiveTransform(src, dst)
     warped = cv2.warpPerspective(np.asarray(img.convert("RGB")), M, (w, h), borderMode=cv2.BORDER_REPLICATE)
     return Image.fromarray(warped, "RGB")
@@ -314,6 +357,57 @@ def _inner_pixels(device: str) -> Tuple[int, int, Tuple[int, int, int, int]]:
     x0, y0 = int(W * fx0), int(H * fy0)
     x1, y1 = int(W * fx1), int(H * fy1)
     return W, H, (x0, y0, x1, y1)
+
+
+def extract_identity_focus_crop(
+    rgb: Image.Image,
+    candidate_meta: Optional[Dict[str, Any]] = None,
+) -> Image.Image:
+    """
+    Crop the replayed screen region before identity scoring.
+
+    AdaFace/ArcFace are much more reliable on the inner device screen than on the
+    full monitor/phone frame, where the face occupies a smaller portion of pixels.
+    """
+    rgb = rgb.convert("RGB")
+    inner = None
+    if isinstance(candidate_meta, dict):
+        raw_inner = candidate_meta.get("inner_rect")
+        if isinstance(raw_inner, (list, tuple)) and len(raw_inner) == 4:
+            try:
+                inner = tuple(int(v) for v in raw_inner)
+            except Exception:
+                inner = None
+
+    if inner is None:
+        return rgb
+
+    w, h = rgb.size
+    x0, y0, x1, y1 = inner
+    inner_w = max(1, x1 - x0)
+    inner_h = max(1, y1 - y0)
+    inner_ar = inner_w / max(inner_h, 1)
+    width_frac = 0.78 if inner_ar > 1.12 else 0.90
+    width_frac = float(np.clip(_float_env("SN54_SR_IDENTITY_CROP_WIDTH_FRAC", width_frac), 0.55, 1.0))
+    height_frac = float(np.clip(_float_env("SN54_SR_IDENTITY_CROP_HEIGHT_FRAC", 0.94), 0.65, 1.0))
+    focus_w = max(1, int(round(inner_w * width_frac)))
+    focus_h = max(1, int(round(inner_h * height_frac)))
+    focus_x0 = x0 + max(0, (inner_w - focus_w) // 2)
+    focus_y0 = y0 + max(0, (inner_h - focus_h) // 2)
+    focus_x1 = min(x1, focus_x0 + focus_w)
+    focus_y1 = min(y1, focus_y0 + focus_h)
+    pad_frac = float(np.clip(_float_env("SN54_SR_IDENTITY_CROP_PAD_FRAC", 0.02), 0.0, 0.16))
+    pad_x = int(max(0, round((focus_x1 - focus_x0) * pad_frac)))
+    pad_y = int(max(0, round((focus_y1 - focus_y0) * pad_frac)))
+    crop = (
+        max(0, focus_x0 - pad_x),
+        max(0, focus_y0 - pad_y),
+        min(w, focus_x1 + pad_x),
+        min(h, focus_y1 + pad_y),
+    )
+    if crop[2] <= crop[0] or crop[3] <= crop[1]:
+        return rgb
+    return rgb.crop(crop)
 
 
 def synthesize_screen_replay(

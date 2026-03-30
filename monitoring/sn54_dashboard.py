@@ -9,11 +9,12 @@ import os
 import re
 import subprocess
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from port_health import PublicPortHealthMonitor, parse_csv_urls, str_to_bool
 
@@ -22,6 +23,7 @@ RUN_PATTERN = re.compile(r"Starting run (\d+) for (\d+) names")
 PROCESSED_PATTERN = re.compile(r"Processed (\d+)/(\d+) names")
 PHASE4_PATTERN = re.compile(r"Phase 4: Successfully created (\d+) S3 submissions")
 LINE_TS_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})")
+TELEGRAM_EVENT_PATTERN = re.compile(r"TELEGRAM_EVENT (\{.*\})")
 
 
 def utc_now_iso() -> str:
@@ -160,6 +162,137 @@ def parse_timestamp_from_line(line: str) -> Optional[str]:
     return dt.astimezone(timezone.utc).isoformat()
 
 
+def _parse_telegram_event(line: str) -> Optional[Tuple[str, Dict[str, object]]]:
+    match = TELEGRAM_EVENT_PATTERN.search(line)
+    if not match:
+        return None
+    try:
+        envelope = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    event = str(envelope.get("event", "") or "")
+    payload = envelope.get("payload")
+    return event, (payload if isinstance(payload, dict) else {})
+
+
+def _fail_reason_summary(payload: object) -> str:
+    if not isinstance(payload, dict) or not payload:
+        return "none"
+    parts = [f"{k}={int(v)}" for k, v in sorted(payload.items()) if int(v) > 0]
+    return ", ".join(parts) if parts else "none"
+
+
+def _recent_event_entry(line: str) -> Optional[Dict[str, str]]:
+    ts = parse_timestamp_from_line(line) or ""
+    low = line.lower()
+    te = _parse_telegram_event(line)
+    if te is not None:
+        event, payload = te
+        if event == "validator_request":
+            validator_name = str(payload.get("validator_name", "unknown") or "unknown")
+            run_id = payload.get("run_id", "n/a")
+            image_request = payload.get("image_request")
+            challenge = ""
+            req_count = 0
+            if isinstance(image_request, dict):
+                challenge = str(image_request.get("challenge_id", "") or "")
+                req_count = int(image_request.get("requested_variations", 0) or 0)
+            return {
+                "timestamp_utc": ts,
+                "level": "info",
+                "title": "Validator Request",
+                "detail": f"{validator_name} | run {run_id} | challenge {challenge or 'n/a'} | image variations {req_count}",
+            }
+        if event == "phase4_variation_preview":
+            label = str(payload.get("label", "") or "variation")
+            attempt = int(payload.get("attempt", 0) or 0)
+            primary = payload.get("primary_score")
+            final = payload.get("final_score")
+            req_index = int(payload.get("request_index", 0) or 0)
+            return {
+                "timestamp_utc": ts,
+                "level": "info",
+                "title": "Generated Preview",
+                "detail": (
+                    f"req #{req_index} | {label} | attempt {attempt} | "
+                    f"primary {primary if primary is not None else 'n/a'} | "
+                    f"final {final if final is not None else 'n/a'}"
+                ),
+            }
+        if event == "validator_submission_status":
+            run_id = payload.get("run_id", "n/a")
+            returned = int(payload.get("returned_names", 0) or 0)
+            requested = int(payload.get("requested_names", 0) or 0)
+            s3_submissions = int(payload.get("s3_submissions", 0) or 0)
+            return {
+                "timestamp_utc": ts,
+                "level": "info",
+                "title": "Submission Status",
+                "detail": (
+                    f"run {run_id} | returned {returned}/{requested} | "
+                    f"s3 submissions {s3_submissions} | failures {_fail_reason_summary(payload.get('fail_reasons'))}"
+                ),
+            }
+
+    run_match = RUN_PATTERN.search(line)
+    if run_match:
+        return {
+            "timestamp_utc": ts,
+            "level": "info",
+            "title": "Run Started",
+            "detail": f"run {run_match.group(1)} for {run_match.group(2)} names",
+        }
+    if "verified call from" in low:
+        return {
+            "timestamp_utc": ts,
+            "level": "info",
+            "title": "Validator Verified",
+            "detail": line.strip(),
+        }
+    if "warning" in low:
+        return {
+            "timestamp_utc": ts,
+            "level": "warn",
+            "title": "Warning",
+            "detail": line.strip(),
+        }
+    if "error" in low:
+        return {
+            "timestamp_utc": ts,
+            "level": "error",
+            "title": "Error",
+            "detail": line.strip(),
+        }
+    if "phase 4:" in low:
+        return {
+            "timestamp_utc": ts,
+            "level": "info",
+            "title": "Phase 4",
+            "detail": line.strip(),
+        }
+    return None
+
+
+def _fresh_current_request_from_payload(payload: Dict[str, object]) -> Dict[str, object]:
+    image_request = payload.get("image_request")
+    image_request_dict = image_request if isinstance(image_request, dict) else {}
+    saved_seed = image_request_dict.get("saved_seed_image")
+    saved_seed_dict = saved_seed if isinstance(saved_seed, dict) else {}
+    return {
+        "run_id": int(payload.get("run_id", 0) or 0),
+        "validator_name": str(payload.get("validator_name", "") or ""),
+        "validator_hotkey": str(payload.get("validator_hotkey", "") or ""),
+        "challenge_id": str(image_request_dict.get("challenge_id", "") or ""),
+        "image_filename": str(image_request_dict.get("image_filename", "") or ""),
+        "requested_variations": list(image_request_dict.get("variation_requests", []) or []),
+        "seed_image_path": str(saved_seed_dict.get("saved_image_path", "") or ""),
+        "seed_metadata_path": str(saved_seed_dict.get("metadata_path", "") or ""),
+        "seed_saved": bool(saved_seed_dict.get("saved", False)),
+        "generated_previews": [],
+        "submission_status": None,
+    }
+
+
 def summarize_logs(lines: List[str]) -> Dict[str, object]:
     metrics: Dict[str, object] = {
         "runs_total": 0,
@@ -173,9 +306,12 @@ def summarize_logs(lines: List[str]) -> Dict[str, object]:
         "last_activity_line": "",
         "last_activity_ts": None,
         "recent_events": [],
+        "current_request": None,
     }
 
-    recent_events: List[str] = []
+    recent_events: List[Dict[str, str]] = []
+    current_request: Optional[Dict[str, object]] = None
+    preview_map: "OrderedDict[str, Dict[str, object]]" = OrderedDict()
     interesting_terms = (
         "starting run",
         "processed ",
@@ -214,10 +350,60 @@ def summarize_logs(lines: List[str]) -> Dict[str, object]:
         if "warning" in low:
             metrics["warnings_total"] += 1
 
-        if any(term in low for term in interesting_terms):
-            recent_events.append(striped)
+        parsed_event = _recent_event_entry(line)
+        if parsed_event is not None:
+            recent_events.append(parsed_event)
+        elif any(term in low for term in interesting_terms):
+            recent_events.append(
+                {
+                    "timestamp_utc": parse_timestamp_from_line(striped) or "",
+                    "level": "info",
+                    "title": "Log",
+                    "detail": striped,
+                }
+            )
+
+        te = _parse_telegram_event(line)
+        if te is not None:
+            event, payload = te
+            if event == "validator_request":
+                current_request = _fresh_current_request_from_payload(payload)
+                preview_map = OrderedDict()
+            elif event == "phase4_variation_preview" and current_request is not None:
+                run_id = int(payload.get("run_id", 0) or 0)
+                challenge_id = str(payload.get("challenge_id", "") or "")
+                current_challenge = str(current_request.get("challenge_id", "") or "")
+                if challenge_id == current_challenge or run_id == int(current_request.get("run_id", 0) or 0):
+                    key = f"{int(payload.get('request_index', 0) or 0)}::{str(payload.get('label', '') or '')}"
+                    preview_map[key] = {
+                        "request_index": int(payload.get("request_index", 0) or 0),
+                        "label": str(payload.get("label", "") or ""),
+                        "attempt": int(payload.get("attempt", 0) or 0),
+                        "primary_score": payload.get("primary_score"),
+                        "final_score": payload.get("final_score"),
+                        "candidate_count": int(payload.get("candidate_count", 0) or 0),
+                        "selected_candidate_index": int(payload.get("selected_candidate_index", 0) or 0),
+                        "image_path": str(payload.get("image_path", "") or ""),
+                        "metadata_path": str(payload.get("metadata_path", "") or ""),
+                        "image_hash": str(payload.get("image_hash", "") or ""),
+                    }
+            elif event == "validator_submission_status" and current_request is not None:
+                run_id = int(payload.get("run_id", 0) or 0)
+                if run_id == int(current_request.get("run_id", 0) or 0):
+                    current_request["submission_status"] = {
+                        "returned_names": int(payload.get("returned_names", 0) or 0),
+                        "requested_names": int(payload.get("requested_names", 0) or 0),
+                        "s3_submissions": int(payload.get("s3_submissions", 0) or 0),
+                        "note": str(payload.get("note", "") or ""),
+                        "fail_reasons": _fail_reason_summary(payload.get("fail_reasons")),
+                    }
 
     metrics["recent_events"] = recent_events[-20:]
+    if current_request is not None:
+        previews = list(preview_map.values())
+        previews.sort(key=lambda item: (int(item.get("request_index", 0)), str(item.get("label", ""))))
+        current_request["generated_previews"] = previews
+    metrics["current_request"] = current_request
     return metrics
 
 
@@ -234,6 +420,7 @@ class DashboardServer(ThreadingHTTPServer):
         self.log_file = log_file
         self.pid_file = pid_file
         self.port_monitor = port_monitor
+        self.project_root = Path(__file__).resolve().parent.parent
 
     def collect_status(self) -> Dict[str, object]:
         pid_status = get_pid_status(self.pid_file)
@@ -282,10 +469,51 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _send_file(self, path: Path) -> None:
+        try:
+            resolved = path.expanduser().resolve()
+            resolved.relative_to(self.server.project_root)
+            if not resolved.is_file():
+                raise FileNotFoundError(str(resolved))
+            data = resolved.read_bytes()
+        except Exception:
+            self._send_json({"error": "Not found"}, status=404)
+            return
+
+        suffix = resolved.suffix.lower()
+        if suffix in {".png"}:
+            mime = "image/png"
+        elif suffix in {".jpg", ".jpeg"}:
+            mime = "image/jpeg"
+        elif suffix in {".webp"}:
+            mime = "image/webp"
+        elif suffix in {".gif"}:
+            mime = "image/gif"
+        else:
+            mime = "application/octet-stream"
+
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self) -> None:  # noqa: N802
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path == "/api/status":
             self._send_json(self.server.collect_status())
+            return
+        if path == "/media":
+            query = parse_qs(parsed.query)
+            requested = ""
+            if query.get("path"):
+                requested = str(query["path"][0] or "")
+            if not requested:
+                self._send_json({"error": "Missing path"}, status=400)
+                return
+            self._send_file(Path(requested))
             return
         if path in ("/", "/index.html"):
             self._send_html(self._render_html())
@@ -411,6 +639,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
       color: #2f3744;
       word-break: break-word;
     }
+    .event-row td:first-child {
+      width: 128px;
+      color: var(--subtle);
+      font-size: 0.82rem;
+      padding-right: 12px;
+      white-space: nowrap;
+    }
+    .event-title {
+      font-weight: 800;
+      margin-bottom: 3px;
+    }
+    .event-detail {
+      color: #324050;
+      line-height: 1.35;
+    }
+    .event-warn .event-title { color: var(--warn); }
+    .event-error .event-title { color: var(--bad); }
     .tail {
       background: #121821;
       color: #d8e5ff;
@@ -424,6 +669,55 @@ class DashboardHandler(BaseHTTPRequestHandler):
     .tail-line {
       white-space: pre-wrap;
       margin: 0;
+    }
+    .request-meta {
+      display: grid;
+      gap: 6px;
+      color: #2f3744;
+      font-size: 0.95rem;
+      margin-bottom: 12px;
+    }
+    .request-meta strong {
+      color: var(--ink);
+    }
+    .variation-list {
+      margin: 0;
+      padding-left: 18px;
+      color: #324050;
+    }
+    .visual-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+    }
+    .image-card {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 10px;
+      background: rgba(255,255,255,0.72);
+    }
+    .image-card img {
+      width: 100%;
+      aspect-ratio: 3 / 4;
+      object-fit: cover;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: rgba(0,0,0,0.05);
+      display: block;
+    }
+    .image-card h3 {
+      margin: 10px 0 6px;
+      font-size: 0.98rem;
+    }
+    .mini {
+      color: var(--subtle);
+      font-size: 0.84rem;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+    .placeholder {
+      color: var(--subtle);
+      font-style: italic;
     }
     @media (max-width: 980px) {
       .span-3 { grid-column: span 6; }
@@ -487,6 +781,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
         <div id="lastActivity" class="hint">Last activity: n/a</div>
       </article>
 
+      <article class="card span-12">
+        <h2>Current Validator Request</h2>
+        <div id="currentRequestMeta" class="request-meta">No validator image request seen yet.</div>
+        <div class="visual-grid">
+          <section class="image-card">
+            <h3>Seed Image</h3>
+            <div id="seedPanel" class="placeholder">Waiting for the next validator seed image.</div>
+          </section>
+          <section class="image-card" style="grid-column: span 2;">
+            <h3>Generated Images Before Submission</h3>
+            <div id="generatedPanel" class="visual-grid">
+              <div class="placeholder">Waiting for generated previews.</div>
+            </div>
+          </section>
+        </div>
+      </article>
+
       <article class="card span-6">
         <h2>Recent Events</h2>
         <table class="events"><tbody id="eventsBody"></tbody></table>
@@ -537,11 +848,217 @@ class DashboardHandler(BaseHTTPRequestHandler):
       }
       for (const event of events.slice().reverse()) {
         const tr = document.createElement("tr");
+        tr.className = "event-row event-" + (event.level || "info");
+        const when = document.createElement("td");
+        when.textContent = event.timestamp_utc
+          ? new Date(event.timestamp_utc).toLocaleTimeString()
+          : "n/a";
         const td = document.createElement("td");
-        td.textContent = event;
+        const title = document.createElement("div");
+        title.className = "event-title";
+        title.textContent = event.title || "Event";
+        const detail = document.createElement("div");
+        detail.className = "event-detail";
+        detail.textContent = event.detail || "";
+        td.appendChild(title);
+        td.appendChild(detail);
+        tr.appendChild(when);
         tr.appendChild(td);
         body.appendChild(tr);
       }
+    }
+
+    function mediaUrl(path) {
+      return "/media?path=" + encodeURIComponent(path);
+    }
+
+    function renderSeedPanel(current) {
+      const seedPanel = document.getElementById("seedPanel");
+      const existingImg = seedPanel.querySelector("img");
+      const nextPath = current && current.seed_saved && current.seed_image_path
+        ? mediaUrl(current.seed_image_path)
+        : "";
+
+      if (!nextPath) {
+        seedPanel.innerHTML = "";
+        seedPanel.textContent = "Seed image not saved for this request.";
+        seedPanel.className = "placeholder";
+        return;
+      }
+
+      seedPanel.className = "";
+      if (!existingImg || existingImg.getAttribute("src") !== nextPath) {
+        seedPanel.innerHTML = "";
+        const img = document.createElement("img");
+        img.src = nextPath;
+        img.alt = "Validator seed image";
+        seedPanel.appendChild(img);
+      }
+
+      let info = seedPanel.querySelector(".mini");
+      const infoText = current.seed_metadata_path || current.seed_image_path || "";
+      if (!info) {
+        info = document.createElement("div");
+        info.className = "mini";
+        seedPanel.appendChild(info);
+      }
+      info.textContent = infoText;
+    }
+
+    function renderGeneratedPanel(previews) {
+      const generatedPanel = document.getElementById("generatedPanel");
+      const normalized = Array.isArray(previews) ? previews : [];
+      if (normalized.length === 0) {
+        if (generatedPanel.dataset.empty !== "true") {
+          generatedPanel.innerHTML = '<div class="placeholder">Waiting for generated previews.</div>';
+          generatedPanel.dataset.empty = "true";
+        }
+        return;
+      }
+      generatedPanel.dataset.empty = "false";
+
+      const desiredKeys = normalized.map(
+        (preview) => `${preview.request_index || 0}::${preview.label || ""}`
+      );
+
+      for (const child of Array.from(generatedPanel.children)) {
+        if (child.classList && child.classList.contains("placeholder")) {
+          child.remove();
+          continue;
+        }
+        const key = child.dataset ? child.dataset.key : "";
+        if (key && !desiredKeys.includes(key)) {
+          child.remove();
+        }
+      }
+
+      for (const preview of normalized) {
+        const key = `${preview.request_index || 0}::${preview.label || ""}`;
+        let card = generatedPanel.querySelector(`.image-card[data-key="${CSS.escape(key)}"]`);
+        if (!card) {
+          card = document.createElement("div");
+          card.className = "image-card";
+          card.dataset.key = key;
+          generatedPanel.appendChild(card);
+        }
+
+        const nextSrc = preview.image_path ? mediaUrl(preview.image_path) : "";
+        let img = card.querySelector("img");
+        if (nextSrc) {
+          if (!img) {
+            img = document.createElement("img");
+            card.appendChild(img);
+          }
+          if (img.getAttribute("src") !== nextSrc) {
+            img.src = nextSrc;
+          }
+          img.alt = preview.label || "Generated preview";
+        } else if (img) {
+          img.remove();
+        }
+
+        let title = card.querySelector("h3");
+        if (!title) {
+          title = document.createElement("h3");
+          card.appendChild(title);
+        }
+        title.textContent = preview.label || "Generated preview";
+
+        let info = card.querySelector(".mini");
+        if (!info) {
+          info = document.createElement("div");
+          info.className = "mini";
+          card.appendChild(info);
+        }
+        const infoHtml =
+          `request #${preview.request_index || 0}<br>` +
+          `attempt ${preview.attempt || 0}, selected ${preview.selected_candidate_index || 0}/${preview.candidate_count || 0}<br>` +
+          `primary score: ${preview.primary_score ?? "n/a"}<br>` +
+          `final score: ${preview.final_score ?? "n/a"}`;
+        if (info.innerHTML !== infoHtml) {
+          info.innerHTML = infoHtml;
+        }
+      }
+
+      normalized.forEach((preview, index) => {
+        const key = `${preview.request_index || 0}::${preview.label || ""}`;
+        const card = generatedPanel.querySelector(`.image-card[data-key="${CSS.escape(key)}"]`);
+        if (card) {
+          const currentChild = generatedPanel.children[index];
+          if (currentChild !== card) {
+            generatedPanel.insertBefore(card, currentChild || null);
+          }
+        }
+      });
+
+      const signature = JSON.stringify(
+        normalized.map((preview) => ({
+          request_index: preview.request_index || 0,
+          label: preview.label || "",
+          attempt: preview.attempt || 0,
+          primary_score: preview.primary_score ?? null,
+          final_score: preview.final_score ?? null,
+          candidate_count: preview.candidate_count || 0,
+          selected_candidate_index: preview.selected_candidate_index || 0,
+          image_path: preview.image_path || "",
+        }))
+      );
+      generatedPanel.dataset.signature = signature;
+      if (generatedPanel.dataset.signature === signature) {
+        return;
+      }
+    }
+
+    function renderCurrentRequest(current) {
+      const meta = document.getElementById("currentRequestMeta");
+      meta.innerHTML = "";
+
+      if (!current) {
+        meta.textContent = "No validator image request seen yet.";
+        renderSeedPanel(null);
+        renderGeneratedPanel([]);
+        return;
+      }
+
+      const lines = [
+        ["Validator", current.validator_name || "unknown"],
+        ["Hotkey", current.validator_hotkey || "n/a"],
+        ["Run", String(current.run_id || "n/a")],
+        ["Challenge", current.challenge_id || "n/a"],
+        ["Seed filename", current.image_filename || "n/a"],
+      ];
+      if (current.submission_status) {
+        const sub = current.submission_status;
+        lines.push([
+          "Submission",
+          `returned ${sub.returned_names || 0}/${sub.requested_names || 0}, s3 ${sub.s3_submissions || 0}, failures ${sub.fail_reasons || "none"}`
+        ]);
+      }
+      for (const [label, value] of lines) {
+        const row = document.createElement("div");
+        row.innerHTML = `<strong>${label}:</strong> ${value}`;
+        meta.appendChild(row);
+      }
+
+      const requested = Array.isArray(current.requested_variations) ? current.requested_variations : [];
+      if (requested.length > 0) {
+        const listTitle = document.createElement("div");
+        listTitle.innerHTML = "<strong>Requested variations:</strong>";
+        meta.appendChild(listTitle);
+        const ul = document.createElement("ul");
+        ul.className = "variation-list";
+        for (const req of requested) {
+          const li = document.createElement("li");
+          li.textContent = `${req.type || "unknown"} (${req.intensity || "n/a"}): ${req.detail || req.description || ""}`;
+          ul.appendChild(li);
+        }
+        meta.appendChild(ul);
+      }
+
+      renderSeedPanel(current);
+
+      const previews = Array.isArray(current.generated_previews) ? current.generated_previews : [];
+      renderGeneratedPanel(previews);
     }
 
     function renderTail(lines) {
@@ -570,6 +1087,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         const metrics = data.metrics || {};
         const log = data.log || {};
         const port = data.port_health || {};
+        const current = metrics.current_request || null;
 
         setBadge(Boolean(miner.running));
         setText("lastRefreshed", "Refreshed at " + new Date().toLocaleString());
@@ -605,6 +1123,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         setText("lastActivity", "Last activity: " + (metrics.last_activity_line || "n/a"));
 
         renderEvents(metrics.recent_events || []);
+        renderCurrentRequest(current);
         renderTail(log.tail_preview || []);
       } catch (err) {
         setBadge(false);

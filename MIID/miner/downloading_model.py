@@ -1,59 +1,86 @@
-"""
-FLUX.2-klein model downloader for MIID miner image generation.
-
-This script uses FLUX.2-klein as a starting point—one of many models you can use.
-You can swap in other diffusion models (e.g. other FLUX variants, Stable Diffusion,
-SDXL, or custom checkpoints) by changing the model ID and the pipeline class below.
-
-What this is:
-  A standalone script that downloads and loads the FLUX.2-klein-4B diffusion model
-  from Hugging Face. Running it once caches the model on disk so the miner does
-  not need to download it during normal operation.
-
-What it does:
-  - Fetches the black-forest-labs/FLUX.2-klein-4B weights (if not already cached).
-  - Loads the pipeline into memory to verify the download.
-  - After a successful run, the cached model can be used by the miner's Phase 4
-    image generation (e.g. generate_variations in image_generator.py) to produce
-    identity-preserving variations (pose, expression, lighting, background) from
-    a base face image when validators send image_request in an IdentitySynapse.
-
-How it fits the miner:
-  - Miner Phase 4 (neurons/miner.py) handles synapse.image_request and calls
-    process_image_request() -> generate_variations() in MIID.miner.image_generator.
-  - That pipeline is intended to use FLUX (or similar) to generate high-quality
-    face variations; this script ensures the FLUX.2-klein model is available
-    locally before you run the miner with real image generation enabled.
-
-Parameters you can change for your machine:
-  - device: "cpu" | "cuda" | "mps"
-      Use "cuda" for NVIDIA GPU, "mps" for Apple Silicon, "cpu" for CPU-only.
-  - dtype: torch.float32 | torch.float16 | torch.bfloat16
-      float32 is safest; float16/bfloat16 reduce memory and can be faster on GPU.
-  - Model ID: "black-forest-labs/FLUX.2-klein-4B" is the default; change only if
-      you switch to a different FLUX variant and update the pipeline class to match.
-"""
+"""Download and load the configured Phase 4 image model into the HF cache."""
 
 import os
 
 import torch
-from diffusers import Flux2KleinPipeline
+from diffusers import Flux2KleinPipeline, QwenImageLayeredPipeline, ZImagePipeline
 
-MODEL_ID = os.environ.get("FLUX_MODEL_ID", "black-forest-labs/FLUX.2-klein-4B")
-device = "cuda" if torch.cuda.is_available() else "cpu"
+BACKEND = (os.environ.get("SN54_IMAGE_GENERATION_BACKEND") or "flux").strip().lower()
+device = (os.environ.get("ZIMAGE_DEVICE") or os.environ.get("FLUX_DEVICE") or "").strip().lower()
+if not device:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
 dtype = torch.float32 if device == "cpu" else (torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
 
 token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or ""
 if not token.strip():
     raise RuntimeError(
         "Set HF_TOKEN or HUGGINGFACE_TOKEN (read token from huggingface.co/settings/tokens)."
+)
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _verify_loaded(pipe, *, target_device: str):
+    loaded_device = target_device
+    try:
+        pipe = pipe.to(target_device)
+    except torch.OutOfMemoryError:
+        if target_device != "cpu":
+            print(
+                f"GPU load verification ran out of memory on {target_device}. "
+                "The model weights are cached already; falling back to CPU verification."
+            )
+            loaded_device = "cpu"
+            pipe = pipe.to("cpu")
+        else:
+            raise
+    return pipe, loaded_device
+
+if BACKEND == "zimage":
+    model_id = os.environ.get("ZIMAGE_MODEL_ID", "Tongyi-MAI/Z-Image")
+    print(f"Downloading Z-Image model: {model_id}")
+    pipe = ZImagePipeline.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+        token=token,
+        low_cpu_mem_usage=False,
+    )
+else:
+    model_id = os.environ.get("FLUX_MODEL_ID", "black-forest-labs/FLUX.2-klein-4B")
+    print(f"Downloading FLUX model: {model_id}")
+    pipe = Flux2KleinPipeline.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+        token=token,
     )
 
-pipe = Flux2KleinPipeline.from_pretrained(
-    MODEL_ID,
-    torch_dtype=dtype,
-    token=token,
-)
-pipe = pipe.to(device)
+pipe, loaded_device = _verify_loaded(pipe, target_device=device)
 
-print("Model downloaded and loaded successfully.")
+print(f"Model downloaded and loaded successfully for backend={BACKEND} on {loaded_device}.")
+
+if _bool_env("SN54_QWEN_LAYERED_ENABLED", True) and (
+    _bool_env("SN54_QWEN_LAYERED_BACKGROUND_EDIT", True)
+    or _bool_env("SN54_QWEN_LAYERED_SCREEN_REPLAY", True)
+):
+    del pipe
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    layered_model_id = os.environ.get("QWEN_LAYERED_MODEL_ID", "Qwen/Qwen-Image-Layered")
+    print(f"Downloading Qwen layered helper model: {layered_model_id}")
+    layered_pipe = QwenImageLayeredPipeline.from_pretrained(
+        layered_model_id,
+        torch_dtype=dtype,
+        token=token,
+        low_cpu_mem_usage=False,
+    )
+    layered_pipe, layered_loaded_device = _verify_loaded(layered_pipe, target_device=device)
+    print(
+        "Model downloaded and loaded successfully for layered helper="
+        f"{layered_model_id} on {layered_loaded_device}."
+    )

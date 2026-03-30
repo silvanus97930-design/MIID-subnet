@@ -242,14 +242,105 @@ def _wire_text_field(req: Any, key: str) -> str:
     return str(v).strip() if v is not None else ""
 
 
+def _wire_seq_field(req: Any, key: str) -> List[str]:
+    v = getattr(req, key, None)
+    if v is None and isinstance(req, dict):
+        v = req.get(key)
+    if not isinstance(v, (list, tuple)):
+        return []
+    out: List[str] = []
+    for item in v:
+        token = str(item).strip().replace("_", " ")
+        if token:
+            out.append(token)
+    return out
+
+
+def _portrait_prompt_clause(req: Any) -> str:
+    clauses: List[str] = []
+    if bool(getattr(req, "passport_style", False)):
+        clauses.append("professional passport-style portrait")
+    if bool(getattr(req, "aspect_ratio_3_4", False)):
+        clauses.append("3:4 aspect ratio framing")
+    if bool(getattr(req, "head_and_shoulders", False)) or bool(getattr(req, "chest_up", False)):
+        clauses.append("head-and-shoulders composition from chest up")
+    return ", ".join(clauses)
+
+
+def _task_prompt_clause(req: Any, var_type: str, intensity: str) -> str:
+    expr_targets = _wire_seq_field(req, "expression_targets")
+    bg_modifiers = _wire_seq_field(req, "background_modifiers")
+    accessories = _wire_seq_field(req, "accessories")
+    pose_bin = _wire_text_field(req, "pose_angle_bin")
+
+    if var_type == "expression_edit":
+        target_text = ", ".join(expr_targets) if expr_targets else "a natural expression shift"
+        strength = {
+            "light": "very subtle",
+            "medium": "clear but natural",
+            "far": "strong and unmistakable",
+        }.get(intensity, "clear")
+        return (
+            f"change only the facial expression to {target_text}, {strength}, "
+            "while keeping head pose, camera framing, hair, clothing, and background essentially unchanged"
+        )
+
+    if var_type == "background_edit":
+        bg_text = ", ".join(bg_modifiers) if bg_modifiers else "a different background environment"
+        accessory_text = ""
+        if accessories:
+            accessory_text = f"; if possible include {' and '.join(accessories)} without hiding the face"
+        return (
+            f"change only the background to {bg_text}, keep the subject centered and unchanged, "
+            "preserve face, pose, expression, and lighting"
+            f"{accessory_text}"
+        )
+
+    if var_type == "lighting_edit":
+        strength = {
+            "light": "subtle illumination adjustment",
+            "medium": "clear directional light change with visible but natural shadows",
+            "far": "dramatic lighting change",
+        }.get(intensity, "lighting change")
+        return (
+            f"change only the lighting, {strength}, preserve facial geometry, skin texture, head pose, "
+            "expression, and background"
+        )
+
+    if var_type == "pose_edit":
+        pose_text = "head pose adjustment"
+        if pose_bin == "light_pm15":
+            pose_text = "slight head turn around 15 degrees"
+        elif pose_bin == "medium_pm30":
+            pose_text = "clear head turn around 30 degrees"
+        elif pose_bin == "far_gt45":
+            pose_text = "near-profile head turn above 45 degrees"
+        return (
+            f"change only the head pose to a {pose_text}, keep expression, lighting, background, and identity stable"
+        )
+
+    return f"{var_type} variation with {intensity} intensity"
+
+
 def _get_prompt_from_request(req: Any, var_type: str, intensity: str) -> str:
-    """Build FLUX prompt from protocol fields (description + detail from validator)."""
+    """Build FLUX prompt from protocol fields plus miner-compiled task hints."""
     description = getattr(req, "description", None) or (req.get("description") if isinstance(req, dict) else None) or ""
     detail = getattr(req, "detail", None) or (req.get("detail") if isinstance(req, dict) else None) or ""
-    parts = [p.strip() for p in (description, detail) if p and p.strip()]
-    if parts:
-        return f"Same person, same identity, {', '.join(parts)}. Preserve face identity."
-    return f"Same person, same identity, {var_type} variation ({intensity} intensity). Preserve face identity."
+    portrait = _portrait_prompt_clause(req)
+    task = _task_prompt_clause(req, var_type, intensity)
+    raw_text = ", ".join([p.strip() for p in (description, detail) if p and p.strip()])
+    clauses = [
+        "same person, same identity",
+        "photorealistic document-photo style portrait",
+    ]
+    if portrait:
+        clauses.append(portrait)
+    clauses.append(task)
+    if raw_text:
+        clauses.append(f"validator requirement: {raw_text}")
+    clauses.append("preserve facial identity, bone structure, skin tone, hairstyle, and age")
+    clauses.append("avoid extra people, avoid hand-over-face occlusion, avoid changing camera distance")
+    return ". ".join(clauses) + "."
 
 
 def _generation_lock_context():

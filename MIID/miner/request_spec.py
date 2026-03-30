@@ -220,6 +220,15 @@ class CompiledVariationRequest:
             intensity=self.intensity.value,
             description=self.description,
             detail=self.detail,
+            pose_angle_bin=self.pose_angle_bin.value,
+            expression_targets=tuple(t.value for t in self.expression_targets),
+            background_modifiers=tuple(t.value for t in self.background_modifiers),
+            accessories=tuple(t.value for t in self.accessories),
+            extra_modifiers=tuple(self.extra_modifiers),
+            passport_style=bool(self.portrait_framing.passport_style),
+            aspect_ratio_3_4=bool(self.portrait_framing.aspect_ratio_3_4),
+            head_and_shoulders=bool(self.portrait_framing.head_and_shoulders),
+            chest_up=bool(self.portrait_framing.chest_up),
         )
         if self.screen_replay is not None:
             ns.screen_replay_device = self.screen_replay.primary_device.value

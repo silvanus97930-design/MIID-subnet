@@ -48,6 +48,39 @@ def _float_env(name: str, default: float) -> float:
         return float(default)
 
 
+def _env_token(value: str) -> str:
+    token = "".join(ch if ch.isalnum() else "_" for ch in str(value or "").strip().upper())
+    while "__" in token:
+        token = token.replace("__", "_")
+    return token.strip("_")
+
+
+def _variation_float_env(prefix: str, variation_type: str, intensity: str, default: float) -> float:
+    type_tok = _env_token(variation_type)
+    intensity_tok = _env_token(intensity)
+    legacy_type_tok = type_tok[:-5] if type_tok.endswith("_EDIT") else type_tok
+    keys: List[str] = []
+    if type_tok and intensity_tok:
+        keys.append(f"{prefix}_{type_tok}_{intensity_tok}")
+    if legacy_type_tok and legacy_type_tok != type_tok and intensity_tok:
+        keys.append(f"{prefix}_{legacy_type_tok}_{intensity_tok}")
+    if type_tok:
+        keys.append(f"{prefix}_{type_tok}")
+    if legacy_type_tok and legacy_type_tok != type_tok:
+        keys.append(f"{prefix}_{legacy_type_tok}")
+    keys.append(prefix)
+
+    for key in keys:
+        raw = os.environ.get(key)
+        if raw is None or str(raw).strip() == "":
+            continue
+        try:
+            return float(str(raw).strip())
+        except Exception:
+            continue
+    return float(default)
+
+
 @dataclass(frozen=True)
 class RerankWeights:
     """Positive weights for identity/heuristics; duplicate term is subtracted."""
@@ -74,6 +107,9 @@ class RerankConfig:
     dup_penalty_seed: float
     dup_penalty_per_sibling: float
     dup_penalty_cap: float
+    missing_score_borrow_scale: float
+    primary_identity_penalty_scale: float
+    primary_identity_floor: float
 
 
 def load_rerank_config_from_env() -> RerankConfig:
@@ -99,6 +135,9 @@ def load_rerank_config_from_env() -> RerankConfig:
         dup_penalty_seed=max(0.0, _float_env("PHASE4_RERANK_DUP_PENALTY_SEED", 0.85)),
         dup_penalty_per_sibling=max(0.0, _float_env("PHASE4_RERANK_DUP_PENALTY_SIBLING", 0.35)),
         dup_penalty_cap=max(0.0, _float_env("PHASE4_RERANK_DUP_PENALTY_CAP", 1.0)),
+        missing_score_borrow_scale=max(0.0, min(1.0, _float_env("PHASE4_RERANK_MISSING_SCORE_BORROW_SCALE", 0.0))),
+        primary_identity_penalty_scale=max(0.0, _float_env("PHASE4_RERANK_PRIMARY_IDENTITY_PENALTY_SCALE", 0.0)),
+        primary_identity_floor=max(0.0, min(1.0, _float_env("PHASE4_RERANK_PRIMARY_IDENTITY_FLOOR", 0.0))),
     )
 
 
@@ -216,8 +255,18 @@ def ensemble_final_score(
 ) -> Tuple[float, Dict[str, float]]:
     """Return (final_score, effective_inputs_used)."""
     w = config.weights
-    arc_e = float(config.fallback_arcface if arcface_score is None else arcface_score)
-    ada_e = float(config.fallback_adaface if adaface_score is None else adaface_score)
+    if arcface_score is None:
+        arc_e = float(config.fallback_arcface)
+        if adaface_score is not None and config.missing_score_borrow_scale > 0.0:
+            arc_e = max(arc_e, min(1.0, float(adaface_score) * config.missing_score_borrow_scale))
+    else:
+        arc_e = float(arcface_score)
+    if adaface_score is None:
+        ada_e = float(config.fallback_adaface)
+        if arcface_score is not None and config.missing_score_borrow_scale > 0.0:
+            ada_e = max(ada_e, min(1.0, float(arcface_score) * config.missing_score_borrow_scale))
+    else:
+        ada_e = float(adaface_score)
     adh_e = float(adherence_score if adherence_score is not None else config.fallback_adherence)
     real_e = float(realism_score if realism_score is not None else config.fallback_realism)
 
@@ -277,9 +326,49 @@ def build_candidate_scores(
                 "blend": 0.0,
                 "notes": ["no VariationAdherenceContext; MSE-only adherence"],
             }
-        real = realism_score_from_image(cand.convert("RGB"), var_scale=cfg.realism_var_scale)
+        real_scale = cfg.realism_var_scale
+        var_type = variation_context.variation_type if variation_context is not None else ""
+        var_intensity = variation_context.intensity if variation_context is not None else ""
+        if var_type:
+            real_scale = _variation_float_env(
+                "PHASE4_RERANK_REALISM_VAR_SCALE",
+                var_type,
+                var_intensity,
+                cfg.realism_var_scale,
+            )
+        real = realism_score_from_image(cand.convert("RGB"), var_scale=real_scale)
         dup = dups[i] if i < len(dups) else 0.0
         final, ex = ensemble_final_score(arc, ada, adh, real, dup, cfg)
+        primary = id_res.primary_similarity
+        if primary is None:
+            primary = ada if ada is not None else arc
+        identity_floor = cfg.primary_identity_floor
+        identity_penalty_scale = cfg.primary_identity_penalty_scale
+        if var_type:
+            identity_floor = _variation_float_env(
+                "PHASE4_RERANK_PRIMARY_IDENTITY_FLOOR",
+                var_type,
+                var_intensity,
+                identity_floor,
+            )
+            identity_penalty_scale = _variation_float_env(
+                "PHASE4_RERANK_PRIMARY_IDENTITY_PENALTY_SCALE",
+                var_type,
+                var_intensity,
+                identity_penalty_scale,
+            )
+        identity_penalty = 0.0
+        if identity_penalty_scale > 0.0 and identity_floor > 0.0:
+            if primary is None:
+                identity_penalty = float(identity_penalty_scale)
+            elif float(primary) < float(identity_floor):
+                identity_penalty = float(
+                    min(
+                        identity_penalty_scale,
+                        identity_penalty_scale * ((float(identity_floor) - float(primary)) / max(float(identity_floor), 1e-6)),
+                    )
+                )
+        final -= identity_penalty
         out.append(
             CandidateScore(
                 arcface_score=arc,
@@ -291,6 +380,11 @@ def build_candidate_scores(
                 extras={
                     **ex,
                     "seed_candidate_mse": mse,
+                    "realism_var_scale": real_scale,
+                    "primary_identity_score": primary,
+                    "identity_floor": identity_floor,
+                    "identity_penalty_scale": identity_penalty_scale,
+                    "identity_penalty": identity_penalty,
                     "adherence_evidence": adh_evidence,
                 },
             )
