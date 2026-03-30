@@ -1,8 +1,9 @@
 # MIID/miner/image_generator.py
 #
 # Phase 4: Image variation generator for miners.
-# Uses FLUX-based generation from generate_variations.py when configured
-# (HF token + model). See MIID.miner.generate_variations module docstring for setup.
+# Delegates raw candidate generation to a pluggable backend (default: FLUX via
+# MIID.miner.generator_backends). Select with SN54_IMAGE_GENERATION_BACKEND=flux|sdxl_img2img.
+# See MIID.miner.generate_variations module docstring for FLUX setup (HF token + model).
 
 import base64
 import hashlib
@@ -17,10 +18,7 @@ import torch
 
 from MIID.miner.ada_face_compare import validate_single_variation
 from MIID.miner.face_preprocess import FacePreprocessResult, preprocess_seed_face
-from MIID.miner.generate_variations import (
-    generate_variations as generate_variations_flux,
-    prewarm_pipeline as prewarm_pipeline_flux,
-)
+from MIID.miner.generator_backends import GenerationConfig, get_image_generator_backend
 from MIID.miner.identity_scoring import IdentityScoreResult, IdentityScoringService
 from MIID.miner.pipeline_observability import log_phase4_json
 
@@ -44,8 +42,12 @@ def calculate_image_hash(image_bytes: bytes) -> str:
 
 
 def prewarm_flux_pipeline() -> None:
-    """Load and optionally warm FLUX once after miner startup."""
-    prewarm_pipeline_flux()
+    """Load and optionally warm the configured image generation backend after miner startup.
+
+    Name kept for backward compatibility; when SN54_IMAGE_GENERATION_BACKEND=flux this
+    matches the previous FLUX-only prewarm behavior.
+    """
+    get_image_generator_backend().prewarm()
 
 
 def _int_env(name: str, default: int) -> int:
@@ -88,7 +90,7 @@ def generate_variations(
     """Generate best-scoring image variation per request.
 
     Workflow:
-    1) FLUX produces multiple candidates per request using batched GPU inference.
+    1) The configured backend (default FLUX) produces multiple candidates per request.
     2) AdaFace scores every candidate via cosine similarity.
     3) The highest-scoring candidate is selected and returned.
 
@@ -172,15 +174,19 @@ def generate_variations(
     default_adaface_device = "cuda" if torch.cuda.is_available() else "cpu"
     adaface_device = (os.environ.get("ADAFACE_DEVICE", default_adaface_device) or "cpu").strip().lower()
 
-    flux_timings: Dict[str, float] = {}
-    raw_results = generate_variations_flux(
-        base_image,
-        variation_requests,
+    generation_timings: Dict[str, float] = {}
+    backend = get_image_generator_backend()
+    gen_config = GenerationConfig(
         candidates_per_request=candidates_per_request,
         request_batch_size=request_batch_size,
         num_inference_steps_override=num_inference_steps_override,
         guidance_scale_override=guidance_scale_override,
-        timings_out=flux_timings,
+    )
+    raw_results = backend.generate_candidates(
+        base_image,
+        variation_requests,
+        gen_config,
+        timings_out=generation_timings,
     )
 
     t_prep0 = time.perf_counter()
@@ -282,22 +288,22 @@ def generate_variations(
 
     reranking_total_ms = adaface_setup_ms + adaface_rerank_ms
     total_ms = (
-        float(flux_timings.get("variation_request_prepare_ms", 0.0))
-        + float(flux_timings.get("flux_generation_ms", 0.0))
+        float(generation_timings.get("variation_request_prepare_ms", 0.0))
+        + float(generation_timings.get("flux_generation_ms", 0.0))
         + reranking_total_ms
         + variation_packaging_ms
     )
     stage_timings_ms = {
-        "request_parse_ms": round(float(flux_timings.get("variation_request_prepare_ms", 0.0)), 4),
-        "generation_ms": round(float(flux_timings.get("flux_generation_ms", 0.0)), 4),
+        "request_parse_ms": round(float(generation_timings.get("variation_request_prepare_ms", 0.0)), 4),
+        "generation_ms": round(float(generation_timings.get("flux_generation_ms", 0.0)), 4),
         "reranking_ms": round(reranking_total_ms, 4),
         "final_packaging_ms": round(variation_packaging_ms, 4),
     }
     if pipeline_timings_out is not None:
         pipeline_timings_out.update(
             {
-                "variation_request_prepare_ms": float(flux_timings.get("variation_request_prepare_ms", 0.0)),
-                "flux_generation_ms": float(flux_timings.get("flux_generation_ms", 0.0)),
+                "variation_request_prepare_ms": float(generation_timings.get("variation_request_prepare_ms", 0.0)),
+                "flux_generation_ms": float(generation_timings.get("flux_generation_ms", 0.0)),
                 "face_preprocess_ms": face_preprocess_ms,
                 "adaface_setup_ms": adaface_setup_ms,
                 "adaface_rerank_ms": adaface_rerank_ms,

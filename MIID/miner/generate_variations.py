@@ -189,6 +189,11 @@ _pipe: Flux2KleinPipeline | None = None
 _PIPE_LOCK = threading.Lock()
 
 
+def ensure_flux_pipeline_loaded() -> None:
+    """Load the FLUX pipeline if not already loaded (no inference warm-up)."""
+    _get_pipeline()
+
+
 def _get_pipeline() -> Flux2KleinPipeline:
     """Load the FLUX pipeline once and reuse. Uses HF_TOKEN or HUGGINGFACE_TOKEN."""
     global _pipe
