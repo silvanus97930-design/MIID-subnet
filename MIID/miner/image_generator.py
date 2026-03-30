@@ -8,6 +8,7 @@
 import base64
 import hashlib
 import io
+import json
 import os
 import time
 from typing import Any, Dict, List, Optional
@@ -21,6 +22,12 @@ from MIID.miner.face_preprocess import FacePreprocessResult, preprocess_seed_fac
 from MIID.miner.generator_backends import GenerationConfig, get_image_generator_backend
 from MIID.miner.identity_scoring import IdentityScoreResult, IdentityScoringService
 from MIID.miner.pipeline_observability import log_phase4_json
+from MIID.miner.reranker import (
+    build_candidate_scores,
+    leaderboard_entries,
+    load_rerank_config_from_env,
+    select_best_candidate_index,
+)
 
 
 def decode_base_image(base64_image: str) -> Image.Image:
@@ -67,16 +74,11 @@ def _face_preprocess_summary(prep: FacePreprocessResult) -> Dict[str, Any]:
     }
 
 
-def _select_best_candidate(scores: List[Optional[float]]) -> tuple[int, Optional[float]]:
-    best_idx = 0
-    best_score: Optional[float] = None
-    for idx, score in enumerate(scores):
-        if score is None:
-            continue
-        if best_score is None or score > best_score:
-            best_idx = idx
-            best_score = float(score)
-    return best_idx, best_score
+def _primary_identity_score(r: IdentityScoreResult) -> Optional[float]:
+    s = r.adaface.similarity if r.adaface.available else None
+    if s is None and r.insightface_arcface.available:
+        s = r.insightface_arcface.similarity
+    return s
 
 
 def generate_variations(
@@ -91,12 +93,14 @@ def generate_variations(
 
     Workflow:
     1) The configured backend (default FLUX) produces multiple candidates per request.
-    2) AdaFace scores every candidate via cosine similarity.
-    3) The highest-scoring candidate is selected and returned.
+    2) Identity backends score every candidate; an ensemble reranker combines
+       ArcFace, AdaFace, adherence (CLIP-free MSE-to-target), realism, and duplicate penalties.
+    3) The candidate with the highest ensemble ``final_score`` is selected (deterministic tie-break).
 
     Returns one selected variation per request with metadata including:
-      - adaface_similarity
-      - candidate_scores
+      - adaface_similarity (best candidate; AdaFace-first, else ArcFace)
+      - candidate_scores (legacy: primary identity similarity per candidate)
+      - ensemble_final_scores, ensemble_leaderboard, candidate_rerank_scores
       - candidate_count
       - selected_candidate_index
     """
@@ -203,11 +207,7 @@ def generate_variations(
     )
     adaface_setup_ms = (time.perf_counter() - t_id0) * 1000.0
 
-    base_ada_available = identity_service.has_base_embedding("adaface")
-    if not base_ada_available:
-        bt.logging.warning(
-            "AdaFace could not extract base embedding. Falling back to first generated candidate per request."
-        )
+    rerank_cfg = load_rerank_config_from_env()
 
     variations: List[Dict] = []
     adaface_rerank_ms = 0.0
@@ -224,19 +224,16 @@ def generate_variations(
             continue
 
         tr0 = time.perf_counter()
-        if not base_ada_available:
-            scores = [None] * len(candidates)
-            id_results_struct: List[IdentityScoreResult] = []
-        else:
-            id_results_struct = identity_service.score_candidates(candidates)
-            scores = []
-            for r in id_results_struct:
-                s = r.adaface.similarity if r.adaface.available else None
-                if s is None and r.insightface_arcface.available:
-                    s = r.insightface_arcface.similarity
-                scores.append(s)
+        id_results_struct = identity_service.score_candidates(candidates)
+        scores = [_primary_identity_score(r) for r in id_results_struct]
 
-        best_idx, best_score = _select_best_candidate(scores)
+        ensemble_rows = build_candidate_scores(
+            id_results_struct,
+            base_image,
+            candidates,
+            config=rerank_cfg,
+        )
+        best_idx = select_best_candidate_index(ensemble_rows)
         adaface_rerank_ms += (time.perf_counter() - tr0) * 1000.0
 
         best_image = candidates[best_idx]
@@ -246,13 +243,21 @@ def generate_variations(
         image_hash = calculate_image_hash(image_bytes)
 
         score_payload: List[Optional[float]] = [float(s) if s is not None else None for s in scores]
-        identity_scores_payload: List[Dict[str, Any]] = (
-            [r.to_dict() for r in id_results_struct] if id_results_struct else []
-        )
+        identity_scores_payload: List[Dict[str, Any]] = [r.to_dict() for r in id_results_struct]
         best_identity = (
             id_results_struct[best_idx].to_dict()
             if id_results_struct and 0 <= best_idx < len(id_results_struct)
             else None
+        )
+        best_primary = scores[best_idx] if scores and 0 <= best_idx < len(scores) else None
+        ensemble_final_scores = [float(s.final_score) for s in ensemble_rows]
+        candidate_rerank_scores = [s.to_dict() for s in ensemble_rows]
+        variation_label = f"{var_type}({intensity})"
+        board = leaderboard_entries(ensemble_rows, variation_label=variation_label)
+        bt.logging.info(
+            "Phase4 ensemble leaderboard %s: %s",
+            variation_label,
+            json.dumps(board, default=str),
         )
 
         variations.append(
@@ -261,8 +266,11 @@ def generate_variations(
                 "variation_type": var_type,
                 "image_bytes": image_bytes,
                 "image_hash": image_hash,
-                "adaface_similarity": float(best_score) if best_score is not None else 0.0,
+                "adaface_similarity": float(best_primary) if best_primary is not None else 0.0,
                 "candidate_scores": score_payload,
+                "ensemble_final_scores": ensemble_final_scores,
+                "ensemble_leaderboard": board,
+                "candidate_rerank_scores": candidate_rerank_scores,
                 "candidate_count": len(candidates),
                 "selected_candidate_index": int(best_idx),
                 "prompt": prompt,
@@ -273,10 +281,17 @@ def generate_variations(
         )
         variation_packaging_ms += (time.perf_counter() - tp0) * 1000.0
 
-        score_text = f"{best_score:.4f}" if best_score is not None else "None"
+        best_final = (
+            ensemble_rows[best_idx].final_score
+            if ensemble_rows and 0 <= best_idx < len(ensemble_rows)
+            else None
+        )
+        ef = f"{best_final:.4f}" if best_final is not None else "n/a"
+        pf = f"{best_primary:.4f}" if best_primary is not None else "n/a"
+        score_text = f"ensemble={ef} primary={pf}"
         bt.logging.debug(
             f"Generated {var_type}({intensity}) best candidate "
-            f"idx={best_idx}/{len(candidates)} score={score_text} hash={image_hash[:16]}..."
+            f"idx={best_idx}/{len(candidates)} {score_text} hash={image_hash[:16]}..."
         )
 
     bt.logging.info(
