@@ -51,8 +51,9 @@ _get_pipeline(); adjust prompts if the model expects different wording.
 import gc
 import os
 import threading
+import time
 from contextlib import nullcontext
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 import bittensor as bt
 import torch
@@ -286,6 +287,7 @@ def generate_variations(
     request_batch_size: int | None = None,
     num_inference_steps_override: int | None = None,
     guidance_scale_override: float | None = None,
+    timings_out: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Generate image variation candidates from a base face image using FLUX.2-klein.
@@ -318,6 +320,7 @@ def generate_variations(
     with _generation_lock_context():
         pipe = _get_pipeline()
         prepared: List[Dict[str, Any]] = []
+        t_prep0 = time.perf_counter()
         for req in variation_requests:
             var_type, intensity = _get_type_and_intensity(req)
             prompt = _get_prompt_from_request(req, var_type, intensity)
@@ -329,8 +332,10 @@ def generate_variations(
                     "prompt": prompt,
                 }
             )
+        prepare_ms = (time.perf_counter() - t_prep0) * 1000.0
 
         results: List[Dict[str, Any]] = []
+        generation_ms_total = 0.0
 
         for chunk in _chunked(prepared, batch_size):
             prompts = [entry["prompt"] for entry in chunk]
@@ -352,6 +357,7 @@ def generate_variations(
             for oom_try in range(max_oom_retries + 1):
                 try:
                     _release_cuda_memory()
+                    t_gen0 = time.perf_counter()
                     with torch.inference_mode():
                         out = pipe(
                             prompt=prompts,
@@ -360,6 +366,7 @@ def generate_variations(
                             guidance_scale=guidance_scale,
                             num_images_per_prompt=num_candidates_current,
                         )
+                    generation_ms_total += (time.perf_counter() - t_gen0) * 1000.0
 
                     flat_images = list(getattr(out, "images", []) or [])
                     expected = len(chunk) * num_candidates_current
@@ -409,5 +416,9 @@ def generate_variations(
 
         # Helps avoid VRAM fragmentation across long-running miner sessions.
         _release_cuda_memory()
+
+        if timings_out is not None:
+            timings_out["variation_request_prepare_ms"] = prepare_ms
+            timings_out["flux_generation_ms"] = generation_ms_total
 
         return results

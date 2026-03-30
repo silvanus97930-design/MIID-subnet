@@ -8,7 +8,8 @@ import base64
 import hashlib
 import io
 import os
-from typing import Dict, List, Optional
+import time
+from typing import Any, Dict, List, Optional
 
 import bittensor as bt
 from PIL import Image
@@ -24,6 +25,7 @@ from MIID.miner.generate_variations import (
     generate_variations as generate_variations_flux,
     prewarm_pipeline as prewarm_pipeline_flux,
 )
+from MIID.miner.pipeline_observability import log_phase4_json
 
 
 def decode_base_image(base64_image: str) -> Image.Image:
@@ -73,6 +75,8 @@ def generate_variations(
     variation_requests: List,
     candidates_per_request_override: Optional[int] = None,
     request_batch_size_override: Optional[int] = None,
+    pipeline_timings_out: Optional[Dict[str, float]] = None,
+    obs_context: Optional[Dict[str, Any]] = None,
 ) -> List[Dict]:
     """Generate best-scoring image variation per request.
 
@@ -162,6 +166,7 @@ def generate_variations(
     default_adaface_device = "cuda" if torch.cuda.is_available() else "cpu"
     adaface_device = (os.environ.get("ADAFACE_DEVICE", default_adaface_device) or "cpu").strip().lower()
 
+    flux_timings: Dict[str, float] = {}
     raw_results = generate_variations_flux(
         base_image,
         variation_requests,
@@ -169,11 +174,14 @@ def generate_variations(
         request_batch_size=request_batch_size,
         num_inference_steps_override=num_inference_steps_override,
         guidance_scale_override=guidance_scale_override,
+        timings_out=flux_timings,
     )
 
     # Keep one model and one base embedding per request to avoid repeated overhead.
+    t_ada0 = time.perf_counter()
     adaface_model = load_adaface_model(device=adaface_device)
     base_embedding = extract_face_embedding(adaface_model, base_image, device=adaface_device)
+    adaface_setup_ms = (time.perf_counter() - t_ada0) * 1000.0
 
     if base_embedding is None:
         bt.logging.warning(
@@ -181,6 +189,8 @@ def generate_variations(
         )
 
     variations: List[Dict] = []
+    adaface_rerank_ms = 0.0
+    variation_packaging_ms = 0.0
 
     for item in raw_results:
         var_type = item.get("variation_type", "unknown")
@@ -192,6 +202,7 @@ def generate_variations(
             bt.logging.warning(f"No candidates generated for {var_type}({intensity})")
             continue
 
+        tr0 = time.perf_counter()
         if base_embedding is None:
             scores = [None] * len(candidates)
         else:
@@ -205,8 +216,11 @@ def generate_variations(
             )
 
         best_idx, best_score = _select_best_candidate(scores)
+        adaface_rerank_ms += (time.perf_counter() - tr0) * 1000.0
+
         best_image = candidates[best_idx]
 
+        tp0 = time.perf_counter()
         image_bytes = encode_image_to_bytes(best_image)
         image_hash = calculate_image_hash(image_bytes)
 
@@ -225,6 +239,8 @@ def generate_variations(
                 "prompt": prompt,
             }
         )
+        variation_packaging_ms += (time.perf_counter() - tp0) * 1000.0
+
         score_text = f"{best_score:.4f}" if best_score is not None else "None"
         bt.logging.debug(
             f"Generated {var_type}({intensity}) best candidate "
@@ -235,6 +251,43 @@ def generate_variations(
         f"Generated {len(variations)} best variations "
         f"(candidates/request={candidates_per_request}, batch_size={request_batch_size})"
     )
+
+    reranking_total_ms = adaface_setup_ms + adaface_rerank_ms
+    total_ms = (
+        float(flux_timings.get("variation_request_prepare_ms", 0.0))
+        + float(flux_timings.get("flux_generation_ms", 0.0))
+        + reranking_total_ms
+        + variation_packaging_ms
+    )
+    stage_timings_ms = {
+        "request_parse_ms": round(float(flux_timings.get("variation_request_prepare_ms", 0.0)), 4),
+        "generation_ms": round(float(flux_timings.get("flux_generation_ms", 0.0)), 4),
+        "reranking_ms": round(reranking_total_ms, 4),
+        "final_packaging_ms": round(variation_packaging_ms, 4),
+    }
+    if pipeline_timings_out is not None:
+        pipeline_timings_out.update(
+            {
+                "variation_request_prepare_ms": float(flux_timings.get("variation_request_prepare_ms", 0.0)),
+                "flux_generation_ms": float(flux_timings.get("flux_generation_ms", 0.0)),
+                "adaface_setup_ms": adaface_setup_ms,
+                "adaface_rerank_ms": adaface_rerank_ms,
+                "variation_packaging_ms": variation_packaging_ms,
+                "generate_variations_total_ms": total_ms,
+            }
+        )
+
+    log_payload: Dict[str, Any] = {
+        "stage_timings_ms": stage_timings_ms,
+        "candidates_per_request": candidates_per_request,
+        "request_batch_size": request_batch_size,
+        "variations_returned": len(variations),
+        "generate_variations_total_ms": round(total_ms, 4),
+    }
+    if obs_context:
+        log_payload.update({k: v for k, v in obs_context.items() if v is not None})
+    log_phase4_json("phase4_generate_variations", log_payload)
+
     return variations
 
 

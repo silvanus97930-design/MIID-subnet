@@ -105,6 +105,7 @@ from MIID.miner.image_generator import (
     validate_variation,
     prewarm_flux_pipeline,
 )
+from MIID.miner.pipeline_observability import log_phase4_json
 from MIID.miner.drand_encrypt import encrypt_image_for_drand, is_timelock_available
 from MIID.miner.s3_upload import upload_to_s3
 from MIID.miner import kav_helpers
@@ -2430,6 +2431,8 @@ class Miner(BaseMinerNeuron):
         if not image_request:
             return [], fail_reasons
 
+        t_phase4_start = time.perf_counter()
+
         def req_type(req: Any) -> str:
             return str(getattr(req, "type", None) or (req.get("type") if isinstance(req, dict) else "") or "unknown").strip()
 
@@ -2441,8 +2444,11 @@ class Miner(BaseMinerNeuron):
 
         try:
             bt.logging.info(f"Phase 4: Decoding base image: {image_request.image_filename}")
+            t_decode_start = time.perf_counter()
             base_image = decode_base_image(image_request.base_image)
+            decode_ms = (time.perf_counter() - t_decode_start) * 1000.0
 
+            t_post_decode_start = time.perf_counter()
             seed_image_name = image_request.image_filename
             if seed_image_name.endswith('.png'):
                 seed_image_name = seed_image_name[:-4]
@@ -2507,6 +2513,8 @@ class Miner(BaseMinerNeuron):
                 bt.logging.error("Phase 4: Timelock unavailable; refusing unencrypted submissions")
                 self._increment_fail_reason(fail_reasons, "phase4_timelock_unavailable", len(variation_requests))
                 return [], fail_reasons
+
+            post_decode_setup_ms = (time.perf_counter() - t_post_decode_start) * 1000.0
 
             s3_submissions: List[S3Submission] = []
 
@@ -2573,11 +2581,18 @@ class Miner(BaseMinerNeuron):
                             f"candidates={attempt_candidates}, batch_size={attempt_batch_size}"
                         )
 
+                        pipeline_timings: Dict[str, float] = {}
                         generated = generate_variations(
                             base_image,
                             [request],
                             candidates_per_request_override=attempt_candidates,
                             request_batch_size_override=attempt_batch_size,
+                            pipeline_timings_out=pipeline_timings,
+                            obs_context={
+                                "challenge_id": challenge_id,
+                                "request_index": req_index,
+                                "attempt": attempt,
+                            },
                         )
                         if not generated:
                             last_reason = "phase4_generation_empty"
@@ -2654,6 +2669,7 @@ class Miner(BaseMinerNeuron):
                         message = f"challenge:{challenge_id}:hash:{image_hash}"
                         signature = self.wallet.hotkey.sign(message.encode()).hex()
 
+                        t_submission_pack_start = time.perf_counter()
                         encrypted_data = encrypt_image_for_drand(image_bytes, target_round)
                         if encrypted_data is None:
                             last_reason = "phase4_timelock_encrypt_failed"
@@ -2673,6 +2689,7 @@ class Miner(BaseMinerNeuron):
                             path_signature=path_signature,
                             seed_image_name=seed_image_name,
                         )
+                        submission_packaging_ms = (time.perf_counter() - t_submission_pack_start) * 1000.0
 
                         if not s3_key:
                             last_reason = "phase4_s3_upload_failed"
@@ -2689,6 +2706,36 @@ class Miner(BaseMinerNeuron):
                                 variation_type=base_variation_type,
                                 path_signature=path_signature,
                             )
+                        )
+                        rerank_ms = float(pipeline_timings.get("adaface_setup_ms", 0.0)) + float(
+                            pipeline_timings.get("adaface_rerank_ms", 0.0)
+                        )
+                        log_phase4_json(
+                            "phase4_image_request_variation",
+                            challenge_id=challenge_id,
+                            variation_type=base_variation_type,
+                            intensity=intensity,
+                            candidate_count=candidate_count,
+                            selected_candidate_index=selected_idx,
+                            adaface_similarity=similarity,
+                            total_request_latency_ms=round(
+                                (time.perf_counter() - t_phase4_start) * 1000.0, 4
+                            ),
+                            stage_timings_ms={
+                                "base_image_decode_ms": round(decode_ms, 4),
+                                "post_decode_setup_ms": round(post_decode_setup_ms, 4),
+                                "request_parse_ms": round(
+                                    float(pipeline_timings.get("variation_request_prepare_ms", 0.0)), 4
+                                ),
+                                "generation_ms": round(
+                                    float(pipeline_timings.get("flux_generation_ms", 0.0)), 4
+                                ),
+                                "reranking_ms": round(rerank_ms, 4),
+                                "variation_packaging_ms": round(
+                                    float(pipeline_timings.get("variation_packaging_ms", 0.0)), 4
+                                ),
+                                "submission_packaging_ms": round(submission_packaging_ms, 4),
+                            },
                         )
                         bt.logging.debug(f"Phase 4: Created submission for {label} (request #{req_index})")
                         success = True
@@ -2714,6 +2761,13 @@ class Miner(BaseMinerNeuron):
                 f"Phase 4: Successfully created {len(s3_submissions)} S3 submissions "
                 f"out of {len(variation_requests)} requests"
             )
+            log_phase4_json(
+                "phase4_process_image_request_complete",
+                challenge_id=challenge_id,
+                s3_submissions_count=len(s3_submissions),
+                variation_requests_count=len(variation_requests),
+                total_request_latency_ms=round((time.perf_counter() - t_phase4_start) * 1000.0, 4),
+            )
             if fail_reasons:
                 bt.logging.warning(f"Phase 4 fail reasons: {dict(sorted(fail_reasons.items()))}")
             return s3_submissions, fail_reasons
@@ -2721,6 +2775,11 @@ class Miner(BaseMinerNeuron):
         except Exception as e:
             self._increment_fail_reason(fail_reasons, "phase4_request_error")
             bt.logging.error(f"Phase 4: Error in process_image_request: {e}")
+            log_phase4_json(
+                "phase4_process_image_request_error",
+                total_request_latency_ms=round((time.perf_counter() - t_phase4_start) * 1000.0, 4),
+                error=str(e),
+            )
             return [], fail_reasons
 
     def Get_Respond_LLM(self, prompt: str) -> str:
