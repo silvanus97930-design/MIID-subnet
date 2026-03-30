@@ -1,0 +1,18 @@
+{
+  "fixture_id": "fixture_04_pose_far_screen_tablet_edge_gamma",
+  "description": "pose_edit far plus screen_replay tablet edge+gamma cues",
+  "variation_requests": [
+    {
+      "type": "pose_edit",
+      "intensity": "far",
+      "description": "Change head pose (yaw/pitch/roll) while keeping identity",
+      "detail": ">±45° rotation (near-profile view, significant angle change)"
+    },
+    {
+      "type": "screen_replay",
+      "intensity": "standard",
+      "description": "Screen replay capture — simulate a photo of a face displayed on a tablet screen photographed by a physical camera",
+      "detail": "Generate a realistic screen-replay image: a face shown on a tablet screen and photographed with a camera. Must visibly exhibit at least 2 of these cues: Edge / crop cues — screen borders, bezel reflections, or cropping consistent with display capture; Gamma / contrast shift — colour/brightness characteristics of display capture. The face must be the dominant object (large enough for reliable face detection) and must remain matchable to the seed identity (high similarity score)."
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "fixture_id": "fixture_05_expression_medium_screen_phone_edge_moire",
+  "description": "expression_edit medium plus screen_replay phone edge+moire cues",
+  "variation_requests": [
+    {
+      "type": "expression_edit",
+      "intensity": "medium",
+      "description": "Change facial expression while preserving identity",
+      "detail": "Neutral to smile, serious, or mildly surprised expression"
+    },
+    {
+      "type": "screen_replay",
+      "intensity": "standard",
+      "description": "Screen replay capture — simulate a photo of a face displayed on a phone screen photographed by a physical camera",
+      "detail": "Generate a realistic screen-replay image: a face shown on a phone screen and photographed with a camera. Must visibly exhibit at least 2 of these cues: Edge / crop cues — screen borders, bezel reflections, or cropping consistent with display capture; Moiré / pixel grid — interference pattern from screen subpixels captured by camera. The face must be the dominant object (large enough for reliable face detection) and must remain matchable to the seed identity (high similarity score)."
+    }
+  ]
+}

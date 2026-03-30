@@ -1,0 +1,18 @@
+{
+  "fixture_id": "fixture_03_expression_light_screen_phone_moire_gamma",
+  "description": "expression_edit light plus screen_replay phone moire+gamma cues",
+  "variation_requests": [
+    {
+      "type": "expression_edit",
+      "intensity": "light",
+      "description": "Change facial expression while preserving identity",
+      "detail": "Neutral to slight smile, minor brow movement, relaxed to attentive"
+    },
+    {
+      "type": "screen_replay",
+      "intensity": "standard",
+      "description": "Screen replay capture — simulate a photo of a face displayed on a phone screen photographed by a physical camera",
+      "detail": "Generate a realistic screen-replay image: a face shown on a phone screen and photographed with a camera. Must visibly exhibit at least 2 of these cues: Moiré / pixel grid — interference pattern from screen subpixels captured by camera; Gamma / contrast shift — colour/brightness characteristics of display capture. The face must be the dominant object (large enough for reliable face detection) and must remain matchable to the seed identity (high similarity score)."
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "fixture_id": "fixture_02_background_medium_headcover_screen_laptop_gamma_edge",
+  "description": "background_edit medium with religious head covering plus screen_replay laptop gamma+edge cues",
+  "variation_requests": [
+    {
+      "type": "background_edit",
+      "intensity": "medium",
+      "description": "Change background environment while keeping subject unchanged",
+      "detail": "Change environment type (office to outdoor, solid color to gradient). Additionally, include: religious head covering (hijab, turban, kippah, taqiyah, etc.) appropriate to subject."
+    },
+    {
+      "type": "screen_replay",
+      "intensity": "standard",
+      "description": "Screen replay capture — simulate a photo of a face displayed on a laptop screen photographed by a physical camera",
+      "detail": "Generate a realistic screen-replay image: a face shown on a laptop screen and photographed with a camera. Must visibly exhibit at least 2 of these cues: Gamma / contrast shift — colour/brightness characteristics of display capture; Edge / crop cues — screen borders, bezel reflections, or cropping consistent with display capture. The face must be the dominant object (large enough for reliable face detection) and must remain matchable to the seed identity (high similarity score)."
+    }
+  ]
+}

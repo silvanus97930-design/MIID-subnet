@@ -1,0 +1,18 @@
+{
+  "fixture_id": "fixture_01_pose_medium_screen_laptop_keystone_moire",
+  "description": "pose_edit medium plus screen_replay laptop with perspective/keystone + moire cues",
+  "variation_requests": [
+    {
+      "type": "pose_edit",
+      "intensity": "medium",
+      "description": "Change head pose (yaw/pitch/roll) while keeping identity",
+      "detail": "±30° rotation (clear head turn, profile partially visible)"
+    },
+    {
+      "type": "screen_replay",
+      "intensity": "standard",
+      "description": "Screen replay capture — simulate a photo of a face displayed on a laptop screen photographed by a physical camera",
+      "detail": "Generate a realistic screen-replay image: a face shown on a laptop screen and photographed with a camera. Must visibly exhibit at least 2 of these cues: Perspective / keystone distortion — geometric distortion from off-angle capture; Moiré / pixel grid — interference pattern from screen subpixels captured by camera. The face must be the dominant object (large enough for reliable face detection) and must remain matchable to the seed identity (high similarity score)."
+    }
+  ]
+}
