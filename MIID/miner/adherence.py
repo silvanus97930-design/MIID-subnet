@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 from PIL import Image
 
+
 def _float_env(name: str, default: float) -> float:
     try:
         raw = os.environ.get(name)
@@ -59,6 +60,9 @@ class VariationAdherenceContext:
     description: str = ""
     detail: str = ""
     prompt: str = ""
+    # Exact screen_replay compiler metadata (when present); enables artifact verification hooks.
+    screen_replay_device: Optional[str] = None
+    visual_cue_keys: Optional[Tuple[str, ...]] = None
 
 
 @dataclass
@@ -435,20 +439,50 @@ def validate_screen_replay(
         w_cue, w_frame = 0.55, 0.45
     else:
         w_cue, w_frame = 0.6, 0.4
-    score = float(np.clip(w_cue * cue_score + w_frame * framing, 0.0, 1.0))
-    ev = {
+    heuristic_base = float(np.clip(w_cue * cue_score + w_frame * framing, 0.0, 1.0))
+    score = heuristic_base
+    ev: Dict[str, Any] = {
         "family": "screen_replay",
         "intensity": ctx.intensity,
         "validator": "screen_replay_heuristic_v1",
         "requested_cue_keys": requested,
         "cue_detector_scores": per_cue,
         "metrics": {k: round(float(v), 6) for k, v in m.items()},
-        "subscores": {"requested_cue_coverage": cue_score, "device_framing_proxy": framing},
+        "subscores": {
+            "requested_cue_coverage": cue_score,
+            "device_framing_proxy": framing,
+            "heuristic_base": round(heuristic_base, 4),
+        },
         "notes": [
             "Cue list parsed from description/detail; image detectors are lightweight proxies",
             f"Top-{need} cue scores averaged for coverage",
         ],
     }
+
+    if ctx.screen_replay_device and ctx.visual_cue_keys:
+        from MIID.miner.screen_replay import ScreenReplaySpec, verify_screen_replay_artifacts
+
+        spec = ScreenReplaySpec(
+            device=str(ctx.screen_replay_device).strip().lower() or "unknown",
+            cue_keys=tuple(ctx.visual_cue_keys),
+            description=ctx.description,
+            detail=ctx.detail,
+        )
+        hook = verify_screen_replay_artifacts(cand_rgb.convert("RGB"), spec)
+        ev["artifact_verification"] = hook
+        hook_composite = float(
+            np.clip(
+                0.35 * float(hook["face_dominance_score"])
+                + 0.30 * float(hook["device_plausibility_score"])
+                + 0.35 * float(hook["requested_cue_detector_avg"]),
+                0.0,
+                1.0,
+            )
+        )
+        w_hook = max(0.0, min(1.0, _float_env("PHASE4_ADHERENCE_SCREEN_HOOK_BLEND", 0.42)))
+        score = float(np.clip((1.0 - w_hook) * heuristic_base + w_hook * hook_composite, 0.0, 1.0))
+        ev["subscores"]["artifact_hook_composite"] = round(hook_composite, 4)
+
     return AdherenceResult(score, ev, score >= _pass_threshold())
 
 

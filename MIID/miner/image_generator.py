@@ -29,6 +29,7 @@ from MIID.miner.reranker import (
     load_rerank_config_from_env,
     select_best_candidate_index,
 )
+from MIID.miner.screen_replay import build_raw_results_screen_replay, screen_replay_pipeline_enabled
 
 
 def decode_base_image(base64_image: str) -> Image.Image:
@@ -80,6 +81,12 @@ def _primary_identity_score(r: IdentityScoreResult) -> Optional[float]:
     if s is None and r.insightface_arcface.available:
         s = r.insightface_arcface.similarity
     return s
+
+
+def _req_type(req: Any) -> str:
+    return str(
+        getattr(req, "type", None) or (req.get("type") if isinstance(req, dict) else None) or ""
+    ).strip()
 
 
 def generate_variations(
@@ -180,25 +187,49 @@ def generate_variations(
     adaface_device = (os.environ.get("ADAFACE_DEVICE", default_adaface_device) or "cpu").strip().lower()
 
     generation_timings: Dict[str, float] = {}
-    backend = get_image_generator_backend()
-    gen_config = GenerationConfig(
-        candidates_per_request=candidates_per_request,
-        request_batch_size=request_batch_size,
-        num_inference_steps_override=num_inference_steps_override,
-        guidance_scale_override=guidance_scale_override,
+    use_sr_dedicated = (
+        screen_replay_pipeline_enabled()
+        and len(variation_requests) == 1
+        and _req_type(variation_requests[0]) == "screen_replay"
     )
-    raw_results = backend.generate_candidates(
-        base_image,
-        variation_requests,
-        gen_config,
-        timings_out=generation_timings,
-    )
-
-    t_prep0 = time.perf_counter()
-    face_prep = preprocess_seed_face(base_image, adaface_device)
-    face_preprocess_ms = (time.perf_counter() - t_prep0) * 1000.0
-    if face_prep.warnings:
-        bt.logging.debug(f"Phase 4 face preprocess: {'; '.join(face_prep.warnings)}")
+    face_prep: FacePreprocessResult
+    if use_sr_dedicated:
+        t_face0 = time.perf_counter()
+        face_prep = preprocess_seed_face(base_image, adaface_device)
+        face_preprocess_ms = (time.perf_counter() - t_face0) * 1000.0
+        if face_prep.warnings:
+            bt.logging.debug(f"Phase 4 face preprocess: {'; '.join(face_prep.warnings)}")
+        raw_results = build_raw_results_screen_replay(
+            base_image,
+            variation_requests[0],
+            candidates_per_request,
+            generation_timings,
+            aligned_face=face_prep.aligned_face if face_prep.ok else None,
+        )
+        if not raw_results:
+            bt.logging.warning(
+                "SN54 dedicated screen_replay: missing device/cue metadata; falling back to diffusion backend"
+            )
+            use_sr_dedicated = False
+    if not use_sr_dedicated:
+        backend = get_image_generator_backend()
+        gen_config = GenerationConfig(
+            candidates_per_request=candidates_per_request,
+            request_batch_size=request_batch_size,
+            num_inference_steps_override=num_inference_steps_override,
+            guidance_scale_override=guidance_scale_override,
+        )
+        raw_results = backend.generate_candidates(
+            base_image,
+            variation_requests,
+            gen_config,
+            timings_out=generation_timings,
+        )
+        t_prep0 = time.perf_counter()
+        face_prep = preprocess_seed_face(base_image, adaface_device)
+        face_preprocess_ms = (time.perf_counter() - t_prep0) * 1000.0
+        if face_prep.warnings:
+            bt.logging.debug(f"Phase 4 face preprocess: {'; '.join(face_prep.warnings)}")
 
     t_id0 = time.perf_counter()
     identity_service = IdentityScoringService(device=adaface_device)
@@ -230,12 +261,16 @@ def generate_variations(
         id_results_struct = identity_service.score_candidates(candidates)
         scores = [_primary_identity_score(r) for r in id_results_struct]
 
+        sd = item.get("screen_replay_device")
+        vk = item.get("visual_cue_keys")
         adherence_ctx = VariationAdherenceContext(
             variation_type=str(var_type),
             intensity=str(intensity),
             description=description,
             detail=detail,
             prompt=str(prompt),
+            screen_replay_device=str(sd).strip() if sd else None,
+            visual_cue_keys=tuple(vk) if isinstance(vk, (list, tuple)) and vk else None,
         )
         ensemble_rows = build_candidate_scores(
             id_results_struct,

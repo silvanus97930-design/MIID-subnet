@@ -210,13 +210,21 @@ class CompiledVariationRequest:
     extra_modifiers: Tuple[str, ...]
 
     def as_protocol_request(self) -> SimpleNamespace:
-        """Object compatible with FLUX path (getattr .type / .intensity / .description / .detail)."""
-        return SimpleNamespace(
+        """Object compatible with FLUX path (getattr .type / .intensity / .description / .detail).
+
+        For ``screen_replay``, also exposes ``screen_replay_device`` and ``visual_cue_keys`` for the
+        dedicated screen-replay synthesizer (``MIID.miner.screen_replay``).
+        """
+        ns = SimpleNamespace(
             type=self.variation_type.value,
             intensity=self.intensity.value,
             description=self.description,
             detail=self.detail,
         )
+        if self.screen_replay is not None:
+            ns.screen_replay_device = self.screen_replay.primary_device.value
+            ns.visual_cue_keys = tuple(self.screen_replay.visual_cue_keys)
+        return ns
 
     def label(self) -> str:
         return f"{self.variation_type.value}({self.intensity.value})"
