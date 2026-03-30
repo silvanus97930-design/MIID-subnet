@@ -6,7 +6,7 @@ Concise map of the SN54 miner path from the synapse to S3 submission metadata. B
 
 1. **Entry** — `Miner.forward` finishes name-variation work, then if `synapse.image_request` is set, calls `process_image_request(synapse)` and assigns `synapse.s3_submissions`.
 
-2. **Request parsing (`process_image_request`)** — Reads `IdentitySynapse.image_request` (`ImageRequest`): `base_image` (base64), `image_filename`, `variation_requests` (`VariationRequest`: `type`, `intensity`, `description`, `detail`), `target_drand_round`, `challenge_id`, `reveal_timestamp`. Aborts with fail counters if the request is empty, has no variation requests, or `target_drand_round <= 0`.
+2. **Request parsing (`process_image_request`)** — Reads `IdentitySynapse.image_request` (`ImageRequest`): `base_image` (base64), `image_filename`, `variation_requests` (`VariationRequest`: `type`, `intensity`, `description`, `detail`), `target_drand_round`, `challenge_id`, `reveal_timestamp`. **Before decoding the base image**, `compile_phase4_variation_requests()` (`MIID/miner/request_spec.py`) validates and normalizes each entry into `CompiledVariationRequest` (enums, parsed pose/expression/background/screen-replay/accessory fields). On failure, logs errors and returns fail reason `phase4_request_spec_invalid`. Downstream generation still receives a protocol-compatible object via `compiled.as_protocol_request()`.
 
 3. **Base image decoding** — `decode_base_image(image_request.base_image)` in `image_generator.py` (Base64 → PIL RGB).
 

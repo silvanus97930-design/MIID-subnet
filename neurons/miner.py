@@ -106,6 +106,7 @@ from MIID.miner.image_generator import (
     prewarm_flux_pipeline,
 )
 from MIID.miner.pipeline_observability import log_phase4_json
+from MIID.miner.request_spec import compile_phase4_variation_requests, log_request_spec_errors
 from MIID.miner.drand_encrypt import encrypt_image_for_drand, is_timelock_available
 from MIID.miner.s3_upload import upload_to_s3
 from MIID.miner import kav_helpers
@@ -2433,16 +2434,21 @@ class Miner(BaseMinerNeuron):
 
         t_phase4_start = time.perf_counter()
 
-        def req_type(req: Any) -> str:
-            return str(getattr(req, "type", None) or (req.get("type") if isinstance(req, dict) else "") or "unknown").strip()
-
-        def req_intensity(req: Any) -> str:
-            return str(getattr(req, "intensity", None) or (req.get("intensity") if isinstance(req, dict) else "") or "standard").strip()
-
-        def req_label(req: Any) -> str:
-            return f"{req_type(req)}({req_intensity(req)})"
-
         try:
+            variation_requests = list(image_request.variation_requests or [])
+            if not variation_requests:
+                self._increment_fail_reason(fail_reasons, "phase4_no_variation_requests")
+                return [], fail_reasons
+
+            compiled_ir, spec_errors = compile_phase4_variation_requests(variation_requests)
+            if compiled_ir is None:
+                log_request_spec_errors(spec_errors, challenge_id=None)
+                bt.logging.error(f"Phase 4: request spec compilation failed: {spec_errors}")
+                self._increment_fail_reason(
+                    fail_reasons, "phase4_request_spec_invalid", len(variation_requests)
+                )
+                return [], fail_reasons
+
             bt.logging.info(f"Phase 4: Decoding base image: {image_request.image_filename}")
             t_decode_start = time.perf_counter()
             base_image = decode_base_image(image_request.base_image)
@@ -2455,14 +2461,9 @@ class Miner(BaseMinerNeuron):
             elif seed_image_name.endswith('.jpg') or seed_image_name.endswith('.jpeg'):
                 seed_image_name = seed_image_name.rsplit('.', 1)[0]
 
-            variation_requests = list(image_request.variation_requests or [])
-            if not variation_requests:
-                self._increment_fail_reason(fail_reasons, "phase4_no_variation_requests")
-                return [], fail_reasons
-
-            labels = [req_label(req) for req in variation_requests]
+            labels = [c.label() for c in compiled_ir.variations]
             bt.logging.info(
-                f"Phase 4: Generating {len(variation_requests)} variations "
+                f"Phase 4: Generating {len(compiled_ir.variations)} variations "
                 f"(from validator: {labels})"
             )
 
@@ -2488,7 +2489,9 @@ class Miner(BaseMinerNeuron):
 
             target_round = int(image_request.target_drand_round)
             if target_round <= 0:
-                self._increment_fail_reason(fail_reasons, "phase4_invalid_target_round", len(variation_requests))
+                self._increment_fail_reason(
+                    fail_reasons, "phase4_invalid_target_round", len(compiled_ir.variations)
+                )
                 bt.logging.error(f"Phase 4: Invalid drand target round: {target_round}")
                 return [], fail_reasons
             challenge_id = image_request.challenge_id or "sandbox_test"
@@ -2511,17 +2514,20 @@ class Miner(BaseMinerNeuron):
 
             if not is_timelock_available():
                 bt.logging.error("Phase 4: Timelock unavailable; refusing unencrypted submissions")
-                self._increment_fail_reason(fail_reasons, "phase4_timelock_unavailable", len(variation_requests))
+                self._increment_fail_reason(
+                    fail_reasons, "phase4_timelock_unavailable", len(compiled_ir.variations)
+                )
                 return [], fail_reasons
 
             post_decode_setup_ms = (time.perf_counter() - t_post_decode_start) * 1000.0
 
             s3_submissions: List[S3Submission] = []
 
-            for req_index, request in enumerate(variation_requests, start=1):
-                base_variation_type = req_type(request)
-                intensity = req_intensity(request)
-                label = req_label(request)
+            for req_index, compiled in enumerate(compiled_ir.variations, start=1):
+                request = compiled.as_protocol_request()
+                base_variation_type = compiled.variation_type.value
+                intensity = compiled.intensity.value
+                label = compiled.label()
                 success = False
                 last_reason = "phase4_unknown_failure"
                 # Identity preservation gets harder for near-profile ("far") pose edits.
@@ -2759,7 +2765,7 @@ class Miner(BaseMinerNeuron):
 
             bt.logging.info(
                 f"Phase 4: Successfully created {len(s3_submissions)} S3 submissions "
-                f"out of {len(variation_requests)} requests"
+                f"out of {len(compiled_ir.variations)} requests"
             )
             log_phase4_json(
                 "phase4_process_image_request_complete",
