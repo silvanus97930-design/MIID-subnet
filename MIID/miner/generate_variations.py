@@ -237,6 +237,11 @@ def _get_type_and_intensity(req: Any) -> tuple[str, str]:
     return (var_type, intensity)
 
 
+def _wire_text_field(req: Any, key: str) -> str:
+    v = getattr(req, key, None) or (req.get(key) if isinstance(req, dict) else None)
+    return str(v).strip() if v is not None else ""
+
+
 def _get_prompt_from_request(req: Any, var_type: str, intensity: str) -> str:
     """Build FLUX prompt from protocol fields (description + detail from validator)."""
     description = getattr(req, "description", None) or (req.get("description") if isinstance(req, dict) else None) or ""
@@ -335,6 +340,8 @@ def generate_variations(
                     "variation_type": var_type,
                     "intensity": intensity,
                     "prompt": prompt,
+                    "description": _wire_text_field(req, "description"),
+                    "detail": _wire_text_field(req, "detail"),
                 }
             )
         prepare_ms = (time.perf_counter() - t_prep0) * 1000.0
@@ -415,6 +422,8 @@ def generate_variations(
                         "variation_type": entry["variation_type"],
                         "intensity": entry["intensity"],
                         "prompt": entry["prompt"],
+                        "description": entry.get("description", ""),
+                        "detail": entry.get("detail", ""),
                         "candidates": flat_images[start:end],
                     }
                 )

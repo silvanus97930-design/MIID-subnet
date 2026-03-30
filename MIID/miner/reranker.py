@@ -16,6 +16,7 @@
 # Heuristic and duplicate knobs:
 #
 #   PHASE4_RERANK_ADHERENCE_TARGET_MSE — peak adherence when seed/candidate MSE matches this
+#   PHASE4_RERANK_TASK_ADHERENCE_BLEND — weight for task validators vs MSE proxy (see MIID.miner.adherence)
 #   PHASE4_RERANK_REALISM_VAR_SCALE — Laplacian variance scaling into [0,1]
 #   PHASE4_RERANK_DUP_SEED_MSE_MAX, PHASE4_RERANK_DUP_SIBLING_MSE_MAX
 #   PHASE4_RERANK_DUP_PENALTY_SEED, PHASE4_RERANK_DUP_PENALTY_SIBLING, PHASE4_RERANK_DUP_PENALTY_CAP
@@ -29,6 +30,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from PIL import Image
 
+from MIID.miner.adherence import (
+    AdherenceScorerBundle,
+    VariationAdherenceContext,
+    score_variation_adherence,
+)
 from MIID.miner.identity_scoring import IdentityScoreResult
 
 
@@ -61,6 +67,7 @@ class RerankConfig:
     fallback_adherence: float
     fallback_realism: float
     adherence_target_mse: float
+    task_adherence_blend: float
     realism_var_scale: float
     dup_seed_mse_max: float
     dup_sibling_mse_max: float
@@ -85,6 +92,7 @@ def load_rerank_config_from_env() -> RerankConfig:
         fallback_adherence=_float_env("PHASE4_RERANK_FALLBACK_ADHERENCE", 0.5),
         fallback_realism=_float_env("PHASE4_RERANK_FALLBACK_REALISM", 0.5),
         adherence_target_mse=max(1e-8, _float_env("PHASE4_RERANK_ADHERENCE_TARGET_MSE", 0.015)),
+        task_adherence_blend=max(0.0, min(1.0, _float_env("PHASE4_RERANK_TASK_ADHERENCE_BLEND", 0.88))),
         realism_var_scale=max(1e-6, _float_env("PHASE4_RERANK_REALISM_VAR_SCALE", 400.0)),
         dup_seed_mse_max=max(0.0, _float_env("PHASE4_RERANK_DUP_SEED_MSE_MAX", 1.5e-4)),
         dup_sibling_mse_max=max(0.0, _float_env("PHASE4_RERANK_DUP_SIBLING_MSE_MAX", 2.5e-4)),
@@ -230,6 +238,8 @@ def build_candidate_scores(
     base_rgb: Image.Image,
     candidates: Sequence[Image.Image],
     config: Optional[RerankConfig] = None,
+    variation_context: Optional[VariationAdherenceContext] = None,
+    adherence_scorers: Optional[AdherenceScorerBundle] = None,
 ) -> List[CandidateScore]:
     """One CandidateScore per candidate index (same order as ``candidates``)."""
     cfg = config or load_rerank_config_from_env()
@@ -240,7 +250,33 @@ def build_candidate_scores(
     for i, (id_res, cand) in enumerate(zip(identity_results, candidates)):
         arc, ada = _identity_raw_scores(id_res)
         mse = normalized_mse_seed_candidate(base_rgb, cand.convert("RGB"))
-        adh = adherence_score_from_mse(mse, cfg.adherence_target_mse)
+        mse_adh = adherence_score_from_mse(mse, cfg.adherence_target_mse)
+        if variation_context is not None:
+            ar = score_variation_adherence(
+                base_rgb,
+                cand.convert("RGB"),
+                variation_context,
+                adherence_scorers,
+            )
+            task_adh = float(ar.adherence_score)
+            blend = float(cfg.task_adherence_blend)
+            adh = float(blend * task_adh + (1.0 - blend) * mse_adh)
+            adh_evidence = {
+                "task": ar.evidence,
+                "task_adherence_score": round(task_adh, 6),
+                "mse_proxy_score": round(mse_adh, 6),
+                "blend": blend,
+                "pass_recommendation_task": ar.pass_recommendation,
+            }
+        else:
+            adh = mse_adh
+            adh_evidence = {
+                "task": None,
+                "task_adherence_score": None,
+                "mse_proxy_score": round(mse_adh, 6),
+                "blend": 0.0,
+                "notes": ["no VariationAdherenceContext; MSE-only adherence"],
+            }
         real = realism_score_from_image(cand.convert("RGB"), var_scale=cfg.realism_var_scale)
         dup = dups[i] if i < len(dups) else 0.0
         final, ex = ensemble_final_score(arc, ada, adh, real, dup, cfg)
@@ -255,6 +291,7 @@ def build_candidate_scores(
                 extras={
                     **ex,
                     "seed_candidate_mse": mse,
+                    "adherence_evidence": adh_evidence,
                 },
             )
         )

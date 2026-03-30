@@ -19,6 +19,7 @@ import torch
 
 from MIID.miner.ada_face_compare import validate_single_variation
 from MIID.miner.face_preprocess import FacePreprocessResult, preprocess_seed_face
+from MIID.miner.adherence import VariationAdherenceContext
 from MIID.miner.generator_backends import GenerationConfig, get_image_generator_backend
 from MIID.miner.identity_scoring import IdentityScoreResult, IdentityScoringService
 from MIID.miner.pipeline_observability import log_phase4_json
@@ -217,6 +218,8 @@ def generate_variations(
         var_type = item.get("variation_type", "unknown")
         intensity = item.get("intensity", "standard")
         prompt = item.get("prompt", "")
+        description = str(item.get("description") or "")
+        detail = str(item.get("detail") or "")
         candidates = list(item.get("candidates", []) or [])
 
         if not candidates:
@@ -227,11 +230,19 @@ def generate_variations(
         id_results_struct = identity_service.score_candidates(candidates)
         scores = [_primary_identity_score(r) for r in id_results_struct]
 
+        adherence_ctx = VariationAdherenceContext(
+            variation_type=str(var_type),
+            intensity=str(intensity),
+            description=description,
+            detail=detail,
+            prompt=str(prompt),
+        )
         ensemble_rows = build_candidate_scores(
             id_results_struct,
             base_image,
             candidates,
             config=rerank_cfg,
+            variation_context=adherence_ctx,
         )
         best_idx = select_best_candidate_index(ensemble_rows)
         adaface_rerank_ms += (time.perf_counter() - tr0) * 1000.0
