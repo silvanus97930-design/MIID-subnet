@@ -104,12 +104,20 @@ class S3Submission(BaseModel):
     SECURITY: path_signature prevents malicious miners from writing to other
     miners' S3 paths. The path_signature is derived from the miner's private
     key and can be verified during post-validation.
+
+    Extended fields (challenge_id, intensity, mime, size) are optional for
+    backward compatibility with older validators; clients should treat missing
+    values as unknown.
     """
     s3_key: str  # Path to encrypted file in S3 bucket
     image_hash: str  # SHA256 hash of the original (unencrypted) image
     signature: str  # Wallet signature proving ownership
     variation_type: str  # Which variation type this submission addresses
     path_signature: str  # Unique path component: sign(challenge_id:miner_hotkey)[:16]
+    challenge_id: str = ""
+    intensity: str = ""
+    mime: str = "image/png"
+    size: int = 0  # Plaintext image byte length (pre-encryption)
 
     class Config:
         arbitrary_types_allowed = True

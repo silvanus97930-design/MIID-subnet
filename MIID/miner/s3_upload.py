@@ -11,6 +11,8 @@ import bittensor as bt
 from pathlib import Path
 from typing import Optional
 
+from MIID.miner.pipeline_observability import log_phase4_json
+
 # Try to import boto3 for S3 uploads
 try:
     import boto3
@@ -104,6 +106,18 @@ def ensure_local_storage():
     LOCAL_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _upload_max_retries() -> int:
+    try:
+        return max(1, int((os.environ.get("PHASE4_S3_UPLOAD_MAX_RETRIES") or "3").strip()))
+    except Exception:
+        return 3
+
+
+def _upload_retry_delay_sec(attempt: int) -> float:
+    base = float(os.environ.get("PHASE4_S3_UPLOAD_RETRY_DELAY_SEC") or "0.35")
+    return max(0.05, base) * (2**attempt)
+
+
 def upload_to_s3(
     encrypted_data: bytes,
     miner_hotkey: str,
@@ -113,7 +127,7 @@ def upload_to_s3(
     challenge_id: str,
     variation_type: str,
     path_signature: str,
-    seed_image_name: str
+    seed_image_name: str,
 ) -> Optional[str]:
     """Upload encrypted image to S3 (or local storage as fallback).
 
@@ -157,44 +171,53 @@ def upload_to_s3(
         "size_bytes": str(len(encrypted_data))
     }
 
-    # Try S3 upload if configured
-    # Miners use HTTP PUT directly for public write bucket (no AWS credentials needed)
+    max_retries = _upload_max_retries()
+    last_err: Optional[str] = None
+
     if USE_S3:
         bt.logging.info("[S3] Uploading via HTTP PUT to public write bucket.")
-        if upload_via_http_put(s3_key, encrypted_data, 'application/octet-stream'):
-            bt.logging.info(
-                f"[S3] Uploaded (HTTP PUT): s3://{S3_BUCKET_NAME}/{s3_key} "
-                f"({len(encrypted_data)} bytes)"
+        for attempt in range(max_retries):
+            if upload_via_http_put(s3_key, encrypted_data, "application/octet-stream"):
+                bt.logging.info(
+                    f"[S3] Uploaded (HTTP PUT): s3://{S3_BUCKET_NAME}/{s3_key} "
+                    f"({len(encrypted_data)} bytes)"
+                )
+                return s3_key
+            last_err = "http_put_failed"
+            log_phase4_json(
+                "phase4_s3_upload_attempt_failed",
+                attempt=attempt + 1,
+                max_retries=max_retries,
+                s3_key=s3_key,
+                challenge_id=challenge_id,
+                variation_type=variation_type,
+                error=last_err,
             )
-            return s3_key
-        else:
-            bt.logging.warning("[S3] HTTP PUT upload failed. Falling back to local storage.")
+            if attempt + 1 < max_retries:
+                time.sleep(_upload_retry_delay_sec(attempt))
+        bt.logging.warning(
+            f"[S3] HTTP PUT exhausted ({max_retries}) for {s3_key}; falling back to local storage"
+        )
 
-    # Fallback to local storage
     try:
         ensure_local_storage()
-
-        # Create full local path
         local_path = LOCAL_STORAGE_DIR / s3_key
         local_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Write encrypted data
         with open(local_path, "wb") as f:
             f.write(encrypted_data)
-
-        # Write metadata file alongside
         metadata_path = local_path.with_suffix(".meta.json")
         with open(metadata_path, "w") as f:
             json.dump(metadata, f, indent=2)
-
-        bt.logging.info(
-            f"[LOCAL STORAGE] Saved: {s3_key} "
-            f"({len(encrypted_data)} bytes)"
-        )
-
+        bt.logging.info(f"[LOCAL STORAGE] Saved: {s3_key} ({len(encrypted_data)} bytes)")
         return s3_key
-
     except Exception as e:
+        log_phase4_json(
+            "phase4_s3_upload_local_failed",
+            s3_key=s3_key,
+            challenge_id=challenge_id,
+            variation_type=variation_type,
+            error=str(e),
+        )
         bt.logging.error(f"[LOCAL STORAGE] Failed to save: {e}")
         return None
 

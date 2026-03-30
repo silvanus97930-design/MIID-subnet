@@ -108,6 +108,14 @@ from MIID.miner.image_generator import (
 from MIID.miner.pipeline_observability import log_phase4_json
 from MIID.miner.request_spec import compile_phase4_variation_requests, log_request_spec_errors
 from MIID.miner.drand_encrypt import encrypt_image_for_drand, is_timelock_available
+from MIID.miner.phase4_submission import (
+    build_submission_manifest,
+    extract_submission_final_score,
+    log_submission_failure,
+    verify_pre_upload,
+    verify_submission_signature,
+    write_submission_manifest_debug,
+)
 from MIID.miner.s3_upload import upload_to_s3
 from MIID.miner import kav_helpers
 
@@ -2672,8 +2680,49 @@ class Miner(BaseMinerNeuron):
                             )
                             continue
 
+                        ok_pre, reason_pre, ev_pre = verify_pre_upload(
+                            variation=var,
+                            image_bytes=image_bytes,
+                            declared_hash=image_hash,
+                            compiled_type=base_variation_type,
+                            compiled_intensity=intensity,
+                            challenge_id=challenge_id,
+                        )
+                        if not ok_pre:
+                            last_reason = reason_pre
+                            log_submission_failure(
+                                reason_pre,
+                                challenge_id=challenge_id,
+                                label=label,
+                                request_index=req_index,
+                                attempt=attempt,
+                                evidence=ev_pre,
+                            )
+                            bt.logging.warning(
+                                f"Phase 4: {label} attempt {attempt}/{max_attempts} pre-upload verification failed: "
+                                f"{reason_pre}"
+                            )
+                            continue
+
                         message = f"challenge:{challenge_id}:hash:{image_hash}"
                         signature = self.wallet.hotkey.sign(message.encode()).hex()
+                        ok_sig, sig_detail = verify_submission_signature(
+                            self.wallet.hotkey, message, signature
+                        )
+                        if not ok_sig:
+                            last_reason = "phase4_submission_signature_invalid"
+                            log_submission_failure(
+                                last_reason,
+                                challenge_id=challenge_id,
+                                label=label,
+                                request_index=req_index,
+                                attempt=attempt,
+                                evidence={"detail": sig_detail},
+                            )
+                            bt.logging.warning(
+                                f"Phase 4: {label} attempt {attempt}/{max_attempts} local signature check failed"
+                            )
+                            continue
 
                         t_submission_pack_start = time.perf_counter()
                         encrypted_data = encrypt_image_for_drand(image_bytes, target_round)
@@ -2683,6 +2732,10 @@ class Miner(BaseMinerNeuron):
                                 f"Phase 4: {label} attempt {attempt}/{max_attempts} encryption failed"
                             )
                             continue
+
+                        plaintext_size = len(image_bytes)
+                        mime = "image/png"
+                        final_score_v = extract_submission_final_score(var)
 
                         s3_key = upload_to_s3(
                             encrypted_data=encrypted_data,
@@ -2699,10 +2752,49 @@ class Miner(BaseMinerNeuron):
 
                         if not s3_key:
                             last_reason = "phase4_s3_upload_failed"
+                            log_submission_failure(
+                                last_reason,
+                                challenge_id=challenge_id,
+                                label=label,
+                                request_index=req_index,
+                                attempt=attempt,
+                                evidence={"encrypted_size": len(encrypted_data)},
+                            )
                             bt.logging.warning(
                                 f"Phase 4: {label} attempt {attempt}/{max_attempts} upload failed"
                             )
                             continue
+
+                        safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", label).strip("_") or "variation"
+                        manifest = build_submission_manifest(
+                            challenge_id=challenge_id,
+                            variation_type=base_variation_type,
+                            intensity=intensity,
+                            image_hash=image_hash,
+                            s3_key=s3_key,
+                            signature=signature,
+                            path_signature=path_signature,
+                            mime=mime,
+                            size=plaintext_size,
+                            target_drand_round=target_round,
+                            request_index=req_index,
+                            final_score=final_score_v,
+                            verified_ok=True,
+                            extra={
+                                "adaface_similarity": similarity,
+                                "candidate_count": candidate_count,
+                                "selected_candidate_index": selected_idx,
+                            },
+                        )
+                        man_dir = (os.environ.get("PHASE4_SUBMISSION_MANIFEST_DEBUG_DIR") or "").strip()
+                        if man_dir:
+                            mpath = write_submission_manifest_debug(
+                                manifest,
+                                directory=man_dir,
+                                basename=f"{challenge_id}_req{req_index:02d}_{safe_label}",
+                            )
+                            if mpath:
+                                bt.logging.info(f"Phase 4: wrote submission manifest to {mpath}")
 
                         s3_submissions.append(
                             S3Submission(
@@ -2711,6 +2803,10 @@ class Miner(BaseMinerNeuron):
                                 signature=signature,
                                 variation_type=base_variation_type,
                                 path_signature=path_signature,
+                                challenge_id=challenge_id,
+                                intensity=intensity,
+                                mime=mime,
+                                size=plaintext_size,
                             )
                         )
                         rerank_ms = float(pipeline_timings.get("adaface_setup_ms", 0.0)) + float(

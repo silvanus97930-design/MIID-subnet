@@ -310,6 +310,7 @@ def generate_variations(
             {
                 "image": best_image,
                 "variation_type": var_type,
+                "intensity": intensity,
                 "image_bytes": image_bytes,
                 "image_hash": image_hash,
                 "adaface_similarity": float(best_primary) if best_primary is not None else 0.0,
