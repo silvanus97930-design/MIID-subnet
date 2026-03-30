@@ -24,5 +24,6 @@ geonamescache==3.0.0
 # Phase 4: Image Variation Sandbox
 Pillow>=9.0.0  # Image processing
 opencv-python-headless  # AdaFace face alignment
+# Optional Phase 4 second scorer: pip install insightface onnxruntime
 pytorch-lightning>=2.0,<3  # AdaFace pretrained .ckpt unpickling (Lightning checkpoint)
 # timelock  # Drand timelock encryption (install separately: pip install timelock; needs Python 3.10 + timelock_wasm_wrapper wheel)

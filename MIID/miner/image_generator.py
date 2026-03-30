@@ -15,16 +15,13 @@ import bittensor as bt
 from PIL import Image
 import torch
 
-from MIID.miner.ada_face_compare import (
-    extract_face_embedding,
-    load_adaface_model,
-    score_variation_candidates,
-    validate_single_variation,
-)
+from MIID.miner.ada_face_compare import validate_single_variation
+from MIID.miner.face_preprocess import FacePreprocessResult, preprocess_seed_face
 from MIID.miner.generate_variations import (
     generate_variations as generate_variations_flux,
     prewarm_pipeline as prewarm_pipeline_flux,
 )
+from MIID.miner.identity_scoring import IdentityScoreResult, IdentityScoringService
 from MIID.miner.pipeline_observability import log_phase4_json
 
 
@@ -56,6 +53,16 @@ def _int_env(name: str, default: int) -> int:
         return max(1, int((os.environ.get(name) or "").strip() or str(default)))
     except Exception:
         return default
+
+
+def _face_preprocess_summary(prep: FacePreprocessResult) -> Dict[str, Any]:
+    return {
+        "ok": prep.ok,
+        "face_count": prep.face_count,
+        "dominant_index": prep.dominant_index,
+        "message": prep.message,
+        "warnings": list(prep.warnings),
+    }
 
 
 def _select_best_candidate(scores: List[Optional[float]]) -> tuple[int, Optional[float]]:
@@ -162,7 +169,6 @@ def generate_variations(
                 _int_env("FLUX_NUM_INFERENCE_STEPS", 20) + 3,
             )
             guidance_scale_override = _float_env("FLUX_GUIDANCE_SCALE_SCREEN_REPLAY_STANDARD", 3.2)
-    adaface_workers = _int_env("ADAFACE_ALIGN_WORKERS", 4)
     default_adaface_device = "cuda" if torch.cuda.is_available() else "cpu"
     adaface_device = (os.environ.get("ADAFACE_DEVICE", default_adaface_device) or "cpu").strip().lower()
 
@@ -177,13 +183,22 @@ def generate_variations(
         timings_out=flux_timings,
     )
 
-    # Keep one model and one base embedding per request to avoid repeated overhead.
-    t_ada0 = time.perf_counter()
-    adaface_model = load_adaface_model(device=adaface_device)
-    base_embedding = extract_face_embedding(adaface_model, base_image, device=adaface_device)
-    adaface_setup_ms = (time.perf_counter() - t_ada0) * 1000.0
+    t_prep0 = time.perf_counter()
+    face_prep = preprocess_seed_face(base_image, adaface_device)
+    face_preprocess_ms = (time.perf_counter() - t_prep0) * 1000.0
+    if face_prep.warnings:
+        bt.logging.debug(f"Phase 4 face preprocess: {'; '.join(face_prep.warnings)}")
 
-    if base_embedding is None:
+    t_id0 = time.perf_counter()
+    identity_service = IdentityScoringService(device=adaface_device)
+    identity_service.begin_request(
+        base_image,
+        preprocessed_aligned=face_prep.aligned_face if face_prep.ok else None,
+    )
+    adaface_setup_ms = (time.perf_counter() - t_id0) * 1000.0
+
+    base_ada_available = identity_service.has_base_embedding("adaface")
+    if not base_ada_available:
         bt.logging.warning(
             "AdaFace could not extract base embedding. Falling back to first generated candidate per request."
         )
@@ -203,17 +218,17 @@ def generate_variations(
             continue
 
         tr0 = time.perf_counter()
-        if base_embedding is None:
+        if not base_ada_available:
             scores = [None] * len(candidates)
+            id_results_struct: List[IdentityScoreResult] = []
         else:
-            scores = score_variation_candidates(
-                base_image,
-                candidates,
-                model=adaface_model,
-                device=adaface_device,
-                parallel_workers=adaface_workers,
-                base_embedding=base_embedding,
-            )
+            id_results_struct = identity_service.score_candidates(candidates)
+            scores = []
+            for r in id_results_struct:
+                s = r.adaface.similarity if r.adaface.available else None
+                if s is None and r.insightface_arcface.available:
+                    s = r.insightface_arcface.similarity
+                scores.append(s)
 
         best_idx, best_score = _select_best_candidate(scores)
         adaface_rerank_ms += (time.perf_counter() - tr0) * 1000.0
@@ -225,6 +240,14 @@ def generate_variations(
         image_hash = calculate_image_hash(image_bytes)
 
         score_payload: List[Optional[float]] = [float(s) if s is not None else None for s in scores]
+        identity_scores_payload: List[Dict[str, Any]] = (
+            [r.to_dict() for r in id_results_struct] if id_results_struct else []
+        )
+        best_identity = (
+            id_results_struct[best_idx].to_dict()
+            if id_results_struct and 0 <= best_idx < len(id_results_struct)
+            else None
+        )
 
         variations.append(
             {
@@ -237,6 +260,9 @@ def generate_variations(
                 "candidate_count": len(candidates),
                 "selected_candidate_index": int(best_idx),
                 "prompt": prompt,
+                "identity_scores": identity_scores_payload,
+                "identity_score_selected": best_identity,
+                "face_preprocess": _face_preprocess_summary(face_prep),
             }
         )
         variation_packaging_ms += (time.perf_counter() - tp0) * 1000.0
@@ -251,6 +277,8 @@ def generate_variations(
         f"Generated {len(variations)} best variations "
         f"(candidates/request={candidates_per_request}, batch_size={request_batch_size})"
     )
+
+    identity_service.end_request()
 
     reranking_total_ms = adaface_setup_ms + adaface_rerank_ms
     total_ms = (
@@ -270,6 +298,7 @@ def generate_variations(
             {
                 "variation_request_prepare_ms": float(flux_timings.get("variation_request_prepare_ms", 0.0)),
                 "flux_generation_ms": float(flux_timings.get("flux_generation_ms", 0.0)),
+                "face_preprocess_ms": face_preprocess_ms,
                 "adaface_setup_ms": adaface_setup_ms,
                 "adaface_rerank_ms": adaface_rerank_ms,
                 "variation_packaging_ms": variation_packaging_ms,

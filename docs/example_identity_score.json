@@ -1,0 +1,18 @@
+{
+  "adaface": {
+    "name": "adaface",
+    "available": true,
+    "similarity": 0.912,
+    "error": null,
+    "extra": {}
+  },
+  "insightface_arcface": {
+    "name": "insightface_arcface",
+    "available": false,
+    "similarity": null,
+    "error": "No module named 'insightface'",
+    "extra": {}
+  },
+  "primary_similarity": 0.912,
+  "fusion": "adaface"
+}
