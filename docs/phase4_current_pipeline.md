@@ -1,38 +1,49 @@
 # Phase 4 image pipeline (current miner)
 
-Concise map of the SN54 miner path from the synapse to S3 submission metadata. Behavior matches `neurons/miner.py`, `MIID/miner/image_generator.py`, `MIID/miner/generate_variations.py`, and `MIID/miner/downloading_model.py` (model prefetch only).
+Current Phase 4 generation is now designed around an external ComfyUI server, with the miner acting as a client/router and keeping the existing request compiler, identity scoring, reranking, encryption, and S3 submission path.
 
 ## End-to-end flow
 
-1. **Entry** — `Miner.forward` finishes name-variation work, then if `synapse.image_request` is set, calls `process_image_request(synapse)` and assigns `synapse.s3_submissions`.
+1. **Entry** — `neurons/miner.py` calls `process_image_request(synapse)` when `synapse.image_request` is present.
+2. **Request parsing** — `MIID/miner/request_spec.py` compiles each validator `VariationRequest` into a normalized request object before generation.
+3. **Base image decode** — `MIID/miner/image_generator.py` converts the Base64 seed image into a PIL RGB image.
+4. **Per-variation loop** — The miner still processes one variation at a time, preserving retry logic, identity thresholds, candidate-count tuning, and submission packaging.
+5. **Request routing** — `MIID/miner/request_routing.py` resolves each incoming validator variation by `type` into a backend route and workflow name. This is per variation, not “all five tasks at once”, so mixed validator requests can be routed correctly.
+6. **ComfyUI backend dispatch** — `MIID/miner/generator_backends/comfyui.py` uploads the seed image to ComfyUI, resolves the task family workflow in `MIID/miner/comfyui_workflows.py`, submits the graph over the ComfyUI HTTP API, waits for completion, and downloads the generated images.
+7. **Task routing** — The backend builds task-specific ComfyUI graphs for:
+   - `pose_edit`: SDXL img2img plus FaceID conditioning, with ControlNet when available
+   - `expression_edit`: SDXL img2img plus IP-Adapter FaceID
+   - `background_edit`: SDXL img2img/outpaint plus IP-Adapter FaceID
+   - `lighting_edit`: ComfyUI lighting-edit path with SDXL fallback graph
+   - `screen_replay`: ComfyUI screen-replay generation path with replay-specific prompt metadata
+8. **Post-generation scoring** — `image_generator.generate_variations()` still runs face preprocessing, AdaFace/ArcFace identity scoring, adherence scoring, ensemble reranking, and candidate selection exactly as before.
+9. **Packaging / submission** — The winning image is encoded, hashed, timelock-encrypted, uploaded to S3, and returned as `S3Submission`.
 
-2. **Request parsing (`process_image_request`)** — Reads `IdentitySynapse.image_request` (`ImageRequest`): `base_image` (base64), `image_filename`, `variation_requests` (`VariationRequest`: `type`, `intensity`, `description`, `detail`), `target_drand_round`, `challenge_id`, `reveal_timestamp`. **Before decoding the base image**, `compile_phase4_variation_requests()` (`MIID/miner/request_spec.py`) validates and normalizes each entry into `CompiledVariationRequest` (enums, parsed pose/expression/background/screen-replay/accessory fields). On failure, logs errors and returns fail reason `phase4_request_spec_invalid`. Downstream generation still receives a protocol-compatible object via `compiled.as_protocol_request()`.
+## Runtime requirements
 
-3. **Base image decoding** — `decode_base_image(image_request.base_image)` in `image_generator.py` (Base64 → PIL RGB).
+- `SN54_IMAGE_GENERATION_BACKEND=comfyui`
+- `COMFYUI_BASE_URL` must point at a running ComfyUI server
+- The startup script now performs a ComfyUI `/system_stats` preflight before launching the miner when the Comfy backend is selected
+- `MIID/miner/downloading_model.py` now verifies ComfyUI reachability when the backend is `comfyui`
 
-4. **Per-variation loop** — For each `VariationRequest`, the miner may adjust identity thresholds and candidate/batch limits (e.g. far `pose_edit`, `lighting_edit` medium, `screen_replay` standard), then calls `generate_variations` with a **single** request and optional candidate/batch overrides, with retries on failure.
+## ComfyUI notes
 
-5. **Candidate generation (`generate_variations` in `image_generator.py`)** — Delegates to `generate_variations` in `generate_variations.py` (FLUX): builds prompts from validator `description` + `detail`, runs batched diffusion (`num_images_per_prompt` = candidates per request), returns raw candidate PIL images per request. Adaptive overrides (e.g. far pose) widen candidate counts and tweak steps/guidance via env-driven caps.
+- The current implementation queries the live ComfyUI `/object_info` API and adapts to the installed nodes.
+- If preferred nodes for a task family are missing, the backend logs capability notes and uses the best available ComfyUI graph for that task.
+- The current server inventory observed during migration included `sd_xl_base_1.0.safetensors`, `ip-adapter-faceid-plusv2_sdxl.bin`, and one ControlNet file, but not dedicated InstantID or IC-Light nodes. Those can be added later without changing the miner integration surface.
 
-6. **AdaFace scoring** — Loads AdaFace once per `generate_variations` call, extracts a base embedding, scores each candidate with `score_variation_candidates`, then `_select_best_candidate` picks the highest cosine-similarity score.
+## Observability
 
-7. **Candidate selection** — Best candidate is encoded to PNG bytes, SHA-256 `image_hash` computed, metadata attached (`adaface_similarity`, `candidate_scores`, `candidate_count`, `selected_candidate_index`).
+Structured logs still use `MIID.miner.pipeline_observability.log_phase4_json`.
 
-8. **Validation gate** — Miner checks image bytes, optional `validate_variation` if similarity missing, and `adaface_similarity` against env thresholds before accepting.
+- `phase4_generate_variations` now includes the selected backend name.
+- Per-variation metadata carries `backend`, `route_backend`, `route_workflow`, `workflow_name`, optional `comfyui_prompt_id`, and any capability notes alongside the existing scoring data.
 
-9. **Encryption / upload / return** — Builds `challenge:{challenge_id}:hash:{image_hash}`, signs with hotkey. `encrypt_image_for_drand` timelock-encrypts bytes for `target_drand_round`. `upload_to_s3` stores ciphertext and metadata; returns `s3_key`. Response rows are `S3Submission` (`s3_key`, `image_hash`, `signature`, `variation_type`, `path_signature`). `synapse.s3_submissions` lists these; **images are not returned inline**.
+## Key modules
 
-## Observability (structured logs)
-
-JSON logs use `MIID.miner.pipeline_observability.log_phase4_json` (`event` + fields):
-
-- **`phase4_generate_variations`** — Per call to `image_generator.generate_variations`: `stage_timings_ms` (`request_parse_ms`, `generation_ms`, `reranking_ms`, `final_packaging_ms`), plus optional `obs_context` (`challenge_id`, `request_index`, `attempt`).
-- **`phase4_image_request_variation`** — On successful S3 row: `challenge_id`, `variation_type`, `intensity`, `candidate_count`, `selected_candidate_index`, `adaface_similarity`, `total_request_latency_ms`, `stage_timings_ms` (decode, post-decode setup, FLUX/AdaFace/packaging breakdown, `submission_packaging_ms`).
-- **`phase4_process_image_request_complete`** — End of handler: `challenge_id`, counts, `total_request_latency_ms`.
-- **`phase4_process_image_request_error`** — Top-level exception: `total_request_latency_ms`, `error`.
-
-**Naming note:** `request_parse_ms` inside `stage_timings_ms` on the miner row is FLUX **prompt preparation** time (variation requests → prompts). **Post-decode setup** (paths, drand round, challenge id, timelock gate) is `post_decode_setup_ms`. **Base64 → PIL** is `base_image_decode_ms`.
-
-## Model download
-
-`MIID/miner/downloading_model.py` is a standalone Hugging Face prefetch for FLUX weights; it is not invoked on every request but supports offline caches used by `generate_variations.py`.
+- `MIID/miner/comfyui_client.py`
+- `MIID/miner/comfyui_workflows.py`
+- `MIID/miner/generator_backends/comfyui.py`
+- `MIID/miner/image_generator.py`
+- `scripts/miner/load_env.sh`
+- `scripts/miner/start_sn54_miner.sh`

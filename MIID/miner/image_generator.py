@@ -1,9 +1,9 @@
 # MIID/miner/image_generator.py
 #
 # Phase 4: Image variation generator for miners.
-# Delegates raw candidate generation to a pluggable backend (default: FLUX via
-# MIID.miner.generator_backends). Select with SN54_IMAGE_GENERATION_BACKEND=flux|sdxl_img2img.
-# See MIID.miner.generate_variations module docstring for FLUX setup (HF token + model).
+# Delegates raw candidate generation to a pluggable backend (default: ComfyUI via
+# MIID.miner.generator_backends). Select with SN54_IMAGE_GENERATION_BACKEND=comfyui|flux|zimage|sdxl_img2img.
+# Diffusers backends remain available for fallback/testing.
 
 import base64
 import hashlib
@@ -20,15 +20,21 @@ import torch
 from MIID.miner.ada_face_compare import validate_single_variation
 from MIID.miner.face_preprocess import FacePreprocessResult, preprocess_seed_face
 from MIID.miner.adherence import VariationAdherenceContext
-from MIID.miner.generator_backends import GenerationConfig, get_image_generator_backend
+from MIID.miner.generator_backends import (
+    GenerationConfig,
+    get_image_generator_backend,
+    resolve_image_generation_backend_name,
+)
 from MIID.miner.identity_scoring import IdentityScoreResult, IdentityScoringService
 from MIID.miner.layered_edit import (
     layered_background_enabled,
     layered_screen_replay_enabled,
+    prewarm_qwen_layered_pipeline,
     prepare_screen_replay_subject,
     preserve_subject_over_candidate,
 )
 from MIID.miner.pipeline_observability import log_phase4_json
+from MIID.miner.request_routing import resolve_request_route
 from MIID.miner.reranker import (
     build_candidate_scores,
     leaderboard_entries,
@@ -60,13 +66,29 @@ def calculate_image_hash(image_bytes: bytes) -> str:
     return hashlib.sha256(image_bytes).hexdigest()
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    v = (os.environ.get(name) or "").strip().lower()
+    if not v:
+        return default
+    return v in {"1", "true", "yes", "on"}
+
+
 def prewarm_flux_pipeline() -> None:
     """Load and optionally warm the configured image generation backend after miner startup.
 
-    Name kept for backward compatibility; when SN54_IMAGE_GENERATION_BACKEND=flux this
-    matches the previous FLUX-only prewarm behavior.
+    Name kept for backward compatibility; prewarms whatever image backend is configured.
+    Also preloads Qwen-Image-Layered when layered ``background_edit`` / ``screen_replay``
+    helpers are enabled (``SN54_QWEN_LAYERED_PREWARM``, default on).
     """
-    get_image_generator_backend().prewarm()
+    backend_name = resolve_image_generation_backend_name()
+    get_image_generator_backend(backend_name).prewarm()
+    bt.logging.info(f"Image backend prewarm: completed for {backend_name}")
+    if _bool_env("SN54_QWEN_LAYERED_PREWARM", True):
+        try:
+            prewarm_qwen_layered_pipeline()
+            bt.logging.info("Qwen-Image-Layered prewarm: pipeline loaded")
+        except Exception as e:
+            bt.logging.warning(f"Qwen-Image-Layered prewarm skipped: {e}")
 
 
 def _int_env(name: str, default: int) -> int:
@@ -195,6 +217,8 @@ def generate_variations(
         except Exception:
             return float(default)
 
+    backend_name = resolve_image_generation_backend_name()
+
     # Extra quality for far pose edits: they are near-profile and identity is harder
     # to preserve, so we allow more candidates and slightly different FLUX settings.
     num_inference_steps_override: int | None = None
@@ -208,11 +232,12 @@ def generate_variations(
             far_max = _int_env("PHASE4_POSE_FAR_CANDIDATES_PER_REQUEST_MAX", 8)
             candidates_per_request = min(max(candidates_per_request, far_min), far_max)
 
-            num_inference_steps_override = _int_env(
-                "FLUX_NUM_INFERENCE_STEPS_POSE_FAR",
-                _int_env("FLUX_NUM_INFERENCE_STEPS", 20) + 5,
-            )
-            guidance_scale_override = _float_env("FLUX_GUIDANCE_SCALE_POSE_FAR", 3.0)
+            if backend_name != "comfyui":
+                num_inference_steps_override = _int_env(
+                    "FLUX_NUM_INFERENCE_STEPS_POSE_FAR",
+                    _int_env("FLUX_NUM_INFERENCE_STEPS", 20) + 5,
+                )
+                guidance_scale_override = _float_env("FLUX_GUIDANCE_SCALE_POSE_FAR", 3.0)
 
         if req_type == "expression_edit" and req_intensity == "far":
             # Strong expression edits need extra search budget; otherwise reranking
@@ -221,11 +246,12 @@ def generate_variations(
             expr_max = _int_env("PHASE4_EXPRESSION_FAR_MAX_CANDIDATES_PER_REQUEST", 8)
             candidates_per_request = min(max(candidates_per_request, expr_min), expr_max)
 
-            num_inference_steps_override = _int_env(
-                "FLUX_NUM_INFERENCE_STEPS_EXPRESSION_FAR",
-                _int_env("FLUX_NUM_INFERENCE_STEPS", 20) + 4,
-            )
-            guidance_scale_override = _float_env("FLUX_GUIDANCE_SCALE_EXPRESSION_FAR", 3.1)
+            if backend_name != "comfyui":
+                num_inference_steps_override = _int_env(
+                    "FLUX_NUM_INFERENCE_STEPS_EXPRESSION_FAR",
+                    _int_env("FLUX_NUM_INFERENCE_STEPS", 20) + 4,
+                )
+                guidance_scale_override = _float_env("FLUX_GUIDANCE_SCALE_EXPRESSION_FAR", 3.1)
 
         if req_type == "background_edit" and req_intensity in {"light", "medium"}:
             bg_min = _int_env(
@@ -238,14 +264,15 @@ def generate_variations(
             )
             candidates_per_request = min(max(candidates_per_request, bg_min), bg_max)
 
-            num_inference_steps_override = _int_env(
-                f"FLUX_NUM_INFERENCE_STEPS_BACKGROUND_{req_intensity.upper()}",
-                _int_env("FLUX_NUM_INFERENCE_STEPS", 20) + 2,
-            )
-            guidance_scale_override = _float_env(
-                f"FLUX_GUIDANCE_SCALE_BACKGROUND_{req_intensity.upper()}",
-                2.9,
-            )
+            if backend_name != "comfyui":
+                num_inference_steps_override = _int_env(
+                    f"FLUX_NUM_INFERENCE_STEPS_BACKGROUND_{req_intensity.upper()}",
+                    _int_env("FLUX_NUM_INFERENCE_STEPS", 20) + 2,
+                )
+                guidance_scale_override = _float_env(
+                    f"FLUX_GUIDANCE_SCALE_BACKGROUND_{req_intensity.upper()}",
+                    2.9,
+                )
 
         if req_type == "lighting_edit" and req_intensity == "medium":
             # Lighting changes can significantly shift embedding similarity; we
@@ -254,11 +281,12 @@ def generate_variations(
             light_max = _int_env("PHASE4_LIGHTING_MEDIUM_CANDIDATES_PER_REQUEST_MAX", 6)
             candidates_per_request = min(max(candidates_per_request, light_min), light_max)
 
-            num_inference_steps_override = _int_env(
-                "FLUX_NUM_INFERENCE_STEPS_LIGHTING_MEDIUM",
-                _int_env("FLUX_NUM_INFERENCE_STEPS", 20) + 3,
-            )
-            guidance_scale_override = _float_env("FLUX_GUIDANCE_SCALE_LIGHTING_MEDIUM", 3.0)
+            if backend_name != "comfyui":
+                num_inference_steps_override = _int_env(
+                    "FLUX_NUM_INFERENCE_STEPS_LIGHTING_MEDIUM",
+                    _int_env("FLUX_NUM_INFERENCE_STEPS", 20) + 3,
+                )
+                guidance_scale_override = _float_env("FLUX_GUIDANCE_SCALE_LIGHTING_MEDIUM", 3.0)
 
         if req_type == "screen_replay" and req_intensity == "standard":
             # Screen-capture is harder for identity embeddings due to display optics
@@ -268,18 +296,20 @@ def generate_variations(
             screen_max = _int_env("PHASE4_SCREEN_REPLAY_STANDARD_CANDIDATES_PER_REQUEST_MAX", 6)
             candidates_per_request = min(max(candidates_per_request, screen_min), screen_max)
 
-            num_inference_steps_override = _int_env(
-                "FLUX_NUM_INFERENCE_STEPS_SCREEN_REPLAY_STANDARD",
-                _int_env("FLUX_NUM_INFERENCE_STEPS", 20) + 3,
-            )
-            guidance_scale_override = _float_env("FLUX_GUIDANCE_SCALE_SCREEN_REPLAY_STANDARD", 3.2)
+            if backend_name != "comfyui":
+                num_inference_steps_override = _int_env(
+                    "FLUX_NUM_INFERENCE_STEPS_SCREEN_REPLAY_STANDARD",
+                    _int_env("FLUX_NUM_INFERENCE_STEPS", 20) + 3,
+                )
+                guidance_scale_override = _float_env("FLUX_GUIDANCE_SCALE_SCREEN_REPLAY_STANDARD", 3.2)
     default_adaface_device = "cuda" if torch.cuda.is_available() else "cpu"
     adaface_device = (os.environ.get("ADAFACE_DEVICE", default_adaface_device) or "cpu").strip().lower()
 
     generation_timings: Dict[str, float] = {}
     use_sr_dedicated = (
-        screen_replay_pipeline_enabled()
-        and len(variation_requests) == 1
+        len(variation_requests) == 1
+        and backend_name == "screen_replay_dedicated"
+        and screen_replay_pipeline_enabled()
         and _req_type(variation_requests[0]) == "screen_replay"
     )
     screen_replay_layered_meta: Optional[Dict[str, Any]] = None
@@ -312,19 +342,43 @@ def generate_variations(
             )
             use_sr_dedicated = False
     if not use_sr_dedicated:
-        backend = get_image_generator_backend()
         gen_config = GenerationConfig(
             candidates_per_request=candidates_per_request,
             request_batch_size=request_batch_size,
             num_inference_steps_override=num_inference_steps_override,
             guidance_scale_override=guidance_scale_override,
         )
-        raw_results = backend.generate_candidates(
-            base_image,
-            variation_requests,
-            gen_config,
-            timings_out=generation_timings,
-        )
+        routed_backends = {route.backend_name for route in request_routes}
+        if len(routed_backends) == 1:
+            backend = get_image_generator_backend(backend_name)
+            raw_results = backend.generate_candidates(
+                base_image,
+                variation_requests,
+                gen_config,
+                timings_out=generation_timings,
+            )
+        else:
+            raw_results = []
+            for req, route in zip(variation_requests, request_routes):
+                local_timings: Dict[str, float] = {}
+                if route.backend_name == "screen_replay_dedicated" and screen_replay_pipeline_enabled() and _req_type(req) == "screen_replay":
+                    single_raw = build_raw_results_screen_replay(
+                        base_image,
+                        req,
+                        candidates_per_request,
+                        local_timings,
+                    )
+                else:
+                    backend = get_image_generator_backend(route.backend_name)
+                    single_raw = backend.generate_candidates(
+                        base_image,
+                        [req],
+                        gen_config,
+                        timings_out=local_timings,
+                    )
+                raw_results.extend(single_raw)
+                for key, value in local_timings.items():
+                    generation_timings[key] = float(generation_timings.get(key, 0.0)) + float(value)
         t_prep0 = time.perf_counter()
         face_prep = preprocess_seed_face(base_image, adaface_device)
         face_preprocess_ms = (time.perf_counter() - t_prep0) * 1000.0
@@ -435,6 +489,11 @@ def generate_variations(
                 "image": best_image,
                 "variation_type": var_type,
                 "intensity": intensity,
+                "backend": item.get("backend", backend_name),
+                "route_backend": item.get("route_backend", backend_name),
+                "route_workflow": item.get("route_workflow"),
+                "workflow_name": item.get("workflow_name"),
+                "pipeline": item.get("pipeline"),
                 "image_bytes": image_bytes,
                 "image_hash": image_hash,
                 "adaface_similarity": float(best_primary) if best_primary is not None else 0.0,
@@ -450,6 +509,8 @@ def generate_variations(
                 "face_preprocess": _face_preprocess_summary(face_prep),
                 "layered_adjustments": layered_adjustments,
                 "screen_replay_layered_helper": screen_replay_layered_meta,
+                "comfyui_prompt_id": item.get("comfyui_prompt_id"),
+                "comfyui_capability_notes": item.get("comfyui_capability_notes"),
             }
         )
         variation_packaging_ms += (time.perf_counter() - tp0) * 1000.0
@@ -502,6 +563,9 @@ def generate_variations(
 
     log_payload: Dict[str, Any] = {
         "stage_timings_ms": stage_timings_ms,
+        "backend": backend_name,
+        "route_backends": sorted({route.backend_name for route in request_routes}),
+        "route_workflows": [route.workflow_name for route in request_routes],
         "candidates_per_request": candidates_per_request,
         "request_batch_size": request_batch_size,
         "variations_returned": len(variations),

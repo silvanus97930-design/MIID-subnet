@@ -25,6 +25,23 @@ if ! command -v ollama >/dev/null 2>&1; then
   exit 1
 fi
 
+if [[ "${SN54_IMAGE_GENERATION_BACKEND:-comfyui}" == "comfyui" ]]; then
+  if ! python3 - <<'PY'
+import os
+import urllib.request
+
+base_url = (os.environ.get("COMFYUI_BASE_URL") or "http://127.0.0.1:20007").strip().rstrip("/")
+with urllib.request.urlopen(f"{base_url}/system_stats", timeout=20) as response:
+    if response.status != 200:
+        raise RuntimeError(f"unexpected HTTP status {response.status}")
+print(f"ComfyUI reachable at {base_url}")
+PY
+  then
+    echo "ComfyUI preflight failed. Check COMFYUI_BASE_URL and ensure the server is running."
+    exit 1
+  fi
+fi
+
 if [[ -f "${MINER_PID_FILE}" ]]; then
   old_pid="$(cat "${MINER_PID_FILE}" 2>/dev/null || true)"
   if [[ -n "${old_pid}" ]] && kill -0 "${old_pid}" 2>/dev/null; then
@@ -45,6 +62,9 @@ if [[ -n "${HF_TOKEN:-}" ]]; then
 fi
 if [[ -n "${FLUX_DEVICE:-}" ]]; then
   export FLUX_DEVICE
+fi
+if [[ -n "${COMFYUI_BASE_URL:-}" ]]; then
+  export COMFYUI_BASE_URL
 fi
 
 miner_cmd=(

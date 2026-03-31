@@ -2209,15 +2209,16 @@ class Miner(BaseMinerNeuron):
 
     def _run_flux_prewarm(self) -> None:
         try:
-            bt.logging.info("FLUX prewarm: starting background warm-up")
+            backend_name = (os.environ.get("SN54_IMAGE_GENERATION_BACKEND") or "comfyui").strip().lower()
+            bt.logging.info(f"Image backend prewarm: starting background warm-up for {backend_name}")
             prewarm_flux_pipeline()
-            bt.logging.info("FLUX prewarm: completed")
+            bt.logging.info("Image backend prewarm: completed")
         except Exception as e:
-            bt.logging.warning(f"FLUX prewarm skipped: {e}")
+            bt.logging.warning(f"Image backend prewarm skipped: {e}")
 
     def _schedule_flux_prewarm(self) -> None:
         if not self._should_prewarm_flux():
-            bt.logging.info("FLUX prewarm disabled via SN54_FLUX_PREWARM")
+            bt.logging.info("Image backend prewarm disabled via SN54_FLUX_PREWARM")
             return
         thread = threading.Thread(target=self._run_flux_prewarm, name="sn54-flux-prewarm", daemon=True)
         thread.start()

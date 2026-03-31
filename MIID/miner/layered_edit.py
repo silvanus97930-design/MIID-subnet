@@ -6,6 +6,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import bittensor as bt
 import numpy as np
 from PIL import Image, ImageFilter
 
@@ -48,6 +49,10 @@ def layered_background_enabled() -> bool:
 
 def layered_screen_replay_enabled() -> bool:
     return _bool_env("SN54_QWEN_LAYERED_SCREEN_REPLAY", True)
+
+
+def layered_allow_cpu_fallback() -> bool:
+    return _bool_env("SN54_QWEN_LAYERED_ALLOW_CPU_FALLBACK", False)
 
 
 def _resolve_device() -> str:
@@ -98,23 +103,50 @@ def _release_cuda_memory() -> None:
         pass
 
 
+def prewarm_qwen_layered_pipeline() -> None:
+    """Eagerly load ``QwenImageLayeredPipeline`` when layered helpers are enabled.
+
+    Called from miner startup (with the main image backend prewarm) so the first
+    ``background_edit`` / ``screen_replay`` request does not pay full load latency.
+    """
+    if not layered_helper_enabled():
+        return
+    if not (layered_background_enabled() or layered_screen_replay_enabled()):
+        return
+    with _PIPE_LOCK:
+        _get_pipeline()
+
+
 def _get_pipeline():
     global _PIPE
     if _PIPE is not None:
         return _PIPE
     from diffusers import QwenImageLayeredPipeline
+    import torch
 
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or ""
     device = _resolve_device()
-    dtype = _resolve_dtype(device)
+    # HF hub id is Qwen/Qwen-Image-Layered (same weights as qwen/Qwen-Image-Layered redirects).
     model_id = os.environ.get("QWEN_LAYERED_MODEL_ID", "Qwen/Qwen-Image-Layered")
-    kwargs: Dict[str, Any] = {}
-    if dtype is not None:
-        kwargs["torch_dtype"] = dtype
-    if token:
-        kwargs["token"] = token
-    _PIPE = QwenImageLayeredPipeline.from_pretrained(model_id, **kwargs)
-    _PIPE = _PIPE.to(device)
+
+    def _build_pipeline(target_device: str, target_dtype) -> Any:
+        kwargs: Dict[str, Any] = {}
+        if target_dtype is not None:
+            kwargs["torch_dtype"] = target_dtype
+        if token:
+            kwargs["token"] = token
+        pipe = QwenImageLayeredPipeline.from_pretrained(model_id, **kwargs)
+        return pipe.to(target_device)
+
+    try:
+        _PIPE = _build_pipeline(device, _resolve_dtype(device))
+    except torch.OutOfMemoryError:
+        if device == "cpu" or not layered_allow_cpu_fallback():
+            raise
+        bt.logging.warning(f"Qwen-Image-Layered helper ran out of VRAM on {device}; retrying on CPU.")
+        _release_cuda_memory()
+        _PIPE = _build_pipeline("cpu", torch.float32)
+
     try:
         _PIPE.set_progress_bar_config(disable=True)
     except Exception:

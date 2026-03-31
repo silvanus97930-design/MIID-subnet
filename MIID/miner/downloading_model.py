@@ -1,11 +1,12 @@
-"""Download and load the configured Phase 4 image model into the HF cache."""
+"""Prefetch the configured Phase 4 image backend or verify a ComfyUI endpoint."""
 
 import os
+import urllib.request
 
 import torch
 from diffusers import Flux2KleinPipeline, QwenImageLayeredPipeline, ZImagePipeline
 
-BACKEND = (os.environ.get("SN54_IMAGE_GENERATION_BACKEND") or "flux").strip().lower()
+BACKEND = (os.environ.get("SN54_IMAGE_GENERATION_BACKEND") or "comfyui").strip().lower()
 device = (os.environ.get("ZIMAGE_DEVICE") or os.environ.get("FLUX_DEVICE") or "").strip().lower()
 if not device:
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -41,6 +42,16 @@ def _verify_loaded(pipe, *, target_device: str):
         else:
             raise
     return pipe, loaded_device
+
+
+if BACKEND == "comfyui":
+    base_url = (os.environ.get("COMFYUI_BASE_URL") or "http://127.0.0.1:20007").strip().rstrip("/")
+    print(f"Checking ComfyUI endpoint: {base_url}")
+    with urllib.request.urlopen(f"{base_url}/system_stats", timeout=20) as response:
+        payload = response.read().decode("utf-8")
+    print("ComfyUI is reachable.")
+    print(payload)
+    raise SystemExit(0)
 
 if BACKEND == "zimage":
     model_id = os.environ.get("ZIMAGE_MODEL_ID", "Tongyi-MAI/Z-Image")
